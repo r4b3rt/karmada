@@ -1,25 +1,32 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package options
 
 import (
-	"time"
-
 	"github.com/spf13/pflag"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
-	componentbaseconfig "k8s.io/component-base/config"
-	"k8s.io/klog/v2"
-)
 
-var (
-	defaultElectionLeaseDuration = metav1.Duration{Duration: 15 * time.Second}
-	defaultElectionRenewDeadline = metav1.Duration{Duration: 10 * time.Second}
-	defaultElectionRetryPeriod   = metav1.Duration{Duration: 2 * time.Second}
+	"github.com/karmada-io/karmada/pkg/sharedcli/profileflag"
 )
 
 const (
-	defaultBindAddress = "0.0.0.0"
-	defaultPort        = 8443
-	defaultCertDir     = "/tmp/k8s-webhook-server/serving-certs"
+	defaultBindAddress   = "0.0.0.0"
+	defaultPort          = 8443
+	defaultCertDir       = "/tmp/k8s-webhook-server/serving-certs"
+	defaultTLSMinVersion = "1.3"
 )
 
 // Options contains everything necessary to create and run webhook server.
@@ -32,9 +39,34 @@ type Options struct {
 	SecurePort int
 	// CertDir is the directory that contains the server key and certificate.
 	// if not set, webhook server would look up the server key and certificate in {TempDir}/k8s-webhook-server/serving-certs.
-	// The server key and certificate must be named `tls.key` and `tls.crt`, respectively.
-	CertDir        string
-	LeaderElection componentbaseconfig.LeaderElectionConfiguration
+	CertDir string
+	// CertName is the server certificate name. Defaults to tls.crt.
+	CertName string
+	// KeyName is the server key name. Defaults to tls.key.
+	KeyName string
+	// TLSMinVersion is the minimum version of TLS supported. Possible values: 1.0, 1.1, 1.2, 1.3.
+	// Some environments have automated security scans that trigger on TLS versions or insecure cipher suites, and
+	// setting TLS to 1.3 would solve both problems.
+	// Defaults to 1.3.
+	TLSMinVersion string
+	// KubeAPIQPS is the QPS to use while talking with karmada-apiserver.
+	KubeAPIQPS float32
+	// KubeAPIBurst is the burst to allow while talking with karmada-apiserver.
+	KubeAPIBurst int
+	// MetricsBindAddress is the TCP address that the controller should bind to
+	// for serving prometheus metrics.
+	// It can be set to "0" to disable the metrics serving.
+	// Defaults to ":8080".
+	MetricsBindAddress string
+	// HealthProbeBindAddress is the TCP address that the controller should bind to
+	// for serving health probes
+	// Defaults to ":8000".
+	HealthProbeBindAddress string
+
+	DefaultNotReadyTolerationSeconds    int64
+	DefaultUnreachableTolerationSeconds int64
+
+	ProfileOpts profileflag.Options
 }
 
 // NewOptions builds an empty options.
@@ -42,35 +74,27 @@ func NewOptions() *Options {
 	return &Options{}
 }
 
-// Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
-func (o *Options) Complete() {
-	if len(o.LeaderElection.ResourceLock) == 0 {
-		o.LeaderElection.ResourceLock = resourcelock.EndpointsLeasesResourceLock
-		klog.Infof("Set default value: Options.LeaderElection.ResourceLock = %s", resourcelock.EndpointsLeasesResourceLock)
-	}
-
-	if o.LeaderElection.LeaseDuration.Duration.Seconds() == 0 {
-		o.LeaderElection.LeaseDuration = defaultElectionLeaseDuration
-		klog.Infof("Set default value: Options.LeaderElection.LeaseDuration = %s", defaultElectionLeaseDuration.Duration.String())
-	}
-
-	if o.LeaderElection.RenewDeadline.Duration.Seconds() == 0 {
-		o.LeaderElection.RenewDeadline = defaultElectionRenewDeadline
-		klog.Infof("Set default value: Options.LeaderElection.RenewDeadline = %s", defaultElectionRenewDeadline.Duration.String())
-	}
-
-	if o.LeaderElection.RetryPeriod.Duration.Seconds() == 0 {
-		o.LeaderElection.RetryPeriod = defaultElectionRetryPeriod
-		klog.Infof("Set default value: Options.LeaderElection.RetryPeriod = %s", defaultElectionRetryPeriod.Duration.String())
-	}
-}
-
 // AddFlags adds flags to the specified FlagSet.
 func (o *Options) AddFlags(flags *pflag.FlagSet) {
+	flags.Lookup("kubeconfig").Usage = "Path to karmada control plane kubeconfig file."
+
 	flags.StringVar(&o.BindAddress, "bind-address", defaultBindAddress,
 		"The IP address on which to listen for the --secure-port port.")
 	flags.IntVar(&o.SecurePort, "secure-port", defaultPort,
 		"The secure port on which to serve HTTPS.")
 	flags.StringVar(&o.CertDir, "cert-dir", defaultCertDir,
-		"The directory that contains the server key(named tls.key) and certificate(named tls.crt).")
+		"The directory that contains the server key and certificate.")
+	flags.StringVar(&o.CertName, "tls-cert-file-name", "tls.crt", "The name of server certificate.")
+	flags.StringVar(&o.KeyName, "tls-private-key-file-name", "tls.key", "The name of server key.")
+	flags.StringVar(&o.TLSMinVersion, "tls-min-version", defaultTLSMinVersion, "Minimum TLS version supported. Possible values: 1.0, 1.1, 1.2, 1.3.")
+	flags.Float32Var(&o.KubeAPIQPS, "kube-api-qps", 40.0, "QPS to use while talking with karmada-apiserver.")
+	flags.IntVar(&o.KubeAPIBurst, "kube-api-burst", 60, "Burst to use while talking with karmada-apiserver.")
+	flags.StringVar(&o.MetricsBindAddress, "metrics-bind-address", ":8080", "The TCP address that the controller should bind to for serving prometheus metrics(e.g. 127.0.0.1:8080, :8080). It can be set to \"0\" to disable the metrics serving.")
+	flags.StringVar(&o.HealthProbeBindAddress, "health-probe-bind-address", ":8000", "The TCP address that the controller should bind to for serving health probes(e.g. 127.0.0.1:8000, :8000)")
+
+	// webhook flags
+	flags.Int64Var(&o.DefaultNotReadyTolerationSeconds, "default-not-ready-toleration-seconds", 300, "Indicates the tolerationSeconds of the propagation policy toleration for notReady:NoExecute that is added by default to every propagation policy that does not already have such a toleration.")
+	flags.Int64Var(&o.DefaultUnreachableTolerationSeconds, "default-unreachable-toleration-seconds", 300, "Indicates the tolerationSeconds of the propagation policy toleration for unreachable:NoExecute that is added by default to every propagation policy that does not already have such a toleration.")
+
+	o.ProfileOpts.AddFlags(flags)
 }

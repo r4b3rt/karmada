@@ -3,11 +3,17 @@
 ![Karmada-logo](docs/images/Karmada-logo-horizontal-color.png)
 
 
+[![LICENSE](https://img.shields.io/github/license/karmada-io/karmada.svg)](/LICENSE)
+[![Releases](https://img.shields.io/github/v/release/karmada-io/karmada)](https://github.com/karmada-io/karmada/releases/latest)
+[![Slack](https://img.shields.io/badge/slack-join-brightgreen)](https://slack.cncf.io)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/5301/badge)](https://bestpractices.coreinfrastructure.org/projects/5301)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/karmada-io/karmada/badge)](https://securityscorecards.dev/viewer/?uri=github.com/karmada-io/karmada)
 ![build](https://github.com/karmada-io/karmada/actions/workflows/ci.yml/badge.svg)
 [![Go Report Card](https://goreportcard.com/badge/github.com/karmada-io/karmada)](https://goreportcard.com/report/github.com/karmada-io/karmada)
-[![LICENSE](https://img.shields.io/github/license/karmada-io/karmada.svg)](/LICENSE)
-[![Releases](https://img.shields.io/github/release/karmada-io/karmada/all.svg)](https://github.com/karmada-io/karmada/releases)
-[![Slack](https://img.shields.io/badge/slack-join-brightgreen)](https://join.slack.com/t/karmada-io/shared_invite/zt-omhy1wfa-LmAkCLfpDMnBjVXp3_U~0w)
+[![codecov](https://codecov.io/gh/karmada-io/karmada/branch/master/graph/badge.svg?token=ROM8CMPXZ6)](https://codecov.io/gh/karmada-io/karmada)
+[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B28176%2Fgithub.com%2Fkarmada-io%2Fkarmada.svg?type=shield)](https://app.fossa.com/projects/custom%2B28176%2Fgithub.com%2Fkarmada-io%2Fkarmada?ref=badge_shield)
+[![Artifact HUB](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/karmada)](https://artifacthub.io/packages/krew/krew-index/karmada)
+[![CLOMonitor](https://img.shields.io/endpoint?url=https://clomonitor.io/api/projects/cncf/karmada/badge)](https://clomonitor.io/projects/cncf/karmada)
 
 ## Karmada: Open, Multi-Cloud, Multi-Cluster Kubernetes Orchestration
 
@@ -16,6 +22,9 @@ Karmada (Kubernetes Armada) is a Kubernetes management system that enables you t
 Karmada aims to provide turnkey automation for multi-cluster application management in multi-cloud and hybrid cloud scenarios,
 with key features such as centralized multi-cloud management, high availability, failure recovery, and traffic scheduling.
 
+![cncf_logo](docs/images/cncf-logo.png)
+
+Karmada is an incubation project of the [Cloud Native Computing Foundation](https://cncf.io/) (CNCF).
 
 ## Why Karmada:
 - __K8s Native API Compatible__
@@ -36,7 +45,7 @@ with key features such as centralized multi-cloud management, high availability,
     - Support clusters in Public cloud, on-prem or edge
 
 - __Fruitful Multi-Cluster Scheduling Policies__
-    - Cluster Affinity, Multi Cluster Splitting/Rebalancing,
+    - Cluster Affinity, Multi Cluster Splitting/Rebalancing
     - Multi-Dimension HA: Region/AZ/Cluster/Provider
 
 - __Open and Neutral__
@@ -58,22 +67,21 @@ The Karmada Control Plane consists of the following components:
 - Karmada Controller Manager
 - Karmada Scheduler
 
-ETCD stores the karmada API objects, the API Server is the REST endpoint all other components talk to, and the Karmada Controller Manager perform operations based on the API objects you create through the API server.
+ETCD stores the Karmada API objects, the API Server is the REST endpoint all other components talk to, and the Karmada Controller Manager performs operations based on the API objects you create through the API server.
 
-The Karmada Controller Manager runs the various controllers,  the controllers watch karmada objects and then talk to the underlying clusters’ API servers to create regular Kubernetes resources.
+The Karmada Controller Manager runs the various controllers,  the controllers watch Karmada objects and then talk to the underlying clusters' API servers to create regular Kubernetes resources.
 
-1. Cluster Controller: attach kubernetes clusters to Karmada for managing the lifecycle of the clusters by creating cluster object.
-
-2. Policy Controller: the controller watches PropagationPolicy objects. When PropagationPolicy object is added, it selects a group of resources matching the resourceSelector and create ResourceBinding with each single resource object.
-3. Binding Controller: the controller watches ResourceBinding object and create Work object corresponding to each cluster with single resource manifest.
-4. Execution Controller: the controller watches Work objects.When Work objects are created, it will distribute the resources to member clusters.
+1. Cluster Controller: attach Kubernetes clusters to Karmada for managing the lifecycle of the clusters by creating cluster objects.
+2. Policy Controller: the controller watches PropagationPolicy objects. When the PropagationPolicy object is added, it selects a group of resources matching the resourceSelector and creates ResourceBinding with each single resource object.
+3. Binding Controller: the controller watches ResourceBinding object and create Work object corresponding to each cluster with a single resource manifest.
+4. Execution Controller: the controller watches Work objects. When Work objects are created, it will distribute the resources to member clusters.
 
 
 ## Concepts
 
 **Resource template**: Karmada uses Kubernetes Native API definition for federated resource template, to make it easy to integrate with existing tools that already adopt on Kubernetes
 
-**Propagation Policy**: Karmada offers standalone Propagation(placement) Policy API to define multi-cluster scheduling and spreading requirements.
+**Propagation Policy**: Karmada offers a standalone Propagation(placement) Policy API to define multi-cluster scheduling and spreading requirements.
 - Support 1:n mapping of Policy: workload, users don't need to indicate scheduling constraints every time creating federated applications.
 - With default policies, users can just interact with K8s API
 
@@ -89,172 +97,139 @@ The following diagram shows how Karmada resources are involved when propagating 
 ## Quick Start
 
 This guide will cover:
-- Install `karmada` control plane components in a Kubernetes cluster which as known as `host cluster`.
+- Install `karmada` control plane components in a Kubernetes cluster which is known as `host cluster`.
 - Join a member cluster to `karmada` control plane.
-- Propagate an application by `karmada`.
-
-### Demo
-
-There are several demonstrations of common cases.
-
-![Demo](docs/images/demo-3in1.svg)
+- Propagate an application by using `karmada`.
 
 ### Prerequisites
-- [Go](https://golang.org/) version v1.14+
+- [Go](https://golang.org/) version follows [go.mod](https://github.com/karmada-io/karmada/blob/master/go.mod#L3)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) version v1.19+
-- [kind](https://kind.sigs.k8s.io/) version v0.9.0+
+- [kind](https://kind.sigs.k8s.io/) version v0.14.0+
 
-### Install karmada control plane
+### Install the Karmada control plane
 
 #### 1. Clone this repo to your machine:
-```
-# git clone https://github.com/karmada-io/karmada
-```
 
-#### 2. Change to karmada directory:
-```
-# cd karmada
+```bash
+git clone https://github.com/karmada-io/karmada
 ```
 
-#### 3. Deploy and run karmada control plane:
+#### 2. Change to the karmada directory:
 
-Choose a way:
-- [I have not any cluster](#31-i-have-not-any-cluster)
-- [I have present cluster for installing](#32-i-have-present-cluster-for-installing)
-
-
-##### 3.1. I have not any cluster
-
-run the following script: (It will create a host cluster by kind)
-
+```bash
+cd karmada
 ```
-# hack/local-up-karmada.sh
+
+#### 3. Deploy and run Karmada control plane:
+
+run the following script:
+
+```bash
+hack/local-up-karmada.sh
 ```
-The script `hack/local-up-karmada.sh` will do following tasks for you:
-- Start a Kubernetes cluster to run the karmada control plane, aka. the `host cluster`.
-- Build karmada control plane components based on a current codebase.
-- Deploy karmada control plane components on `host cluster`.
+This script will do the following tasks for you:
+- Start a Kubernetes cluster to run the Karmada control plane, aka. the `host cluster`.
+- Build Karmada control plane components based on a current codebase.
+- Deploy Karmada control plane components on the `host cluster`.
+- Create member clusters and join Karmada.
 
 If everything goes well, at the end of the script output, you will see similar messages as follows:
-```
+
+```bash
 Local Karmada is running.
 
-Kubeconfig for karmada in file: /root/.kube/karmada.config, so you can run:
-  export KUBECONFIG="/root/.kube/karmada.config"
-Or use kubectl with --kubeconfig=/root/.kube/karmada.config
-Please use 'kubectl config use-context <Context_Name>' to switch cluster to operate,
-the following is context intro:
-  ------------------------------------------------------
-  |    Context Name   |          Purpose               |
-  |----------------------------------------------------|
-  | karmada-host      | the cluster karmada install in |
-  |----------------------------------------------------|
-  | karmada-apiserver | karmada control plane          |
-  ------------------------------------------------------
+To start using your Karmada environment, run:
+  export KUBECONFIG="$HOME/.kube/karmada.config"
+Please use 'kubectl config use-context karmada-host/karmada-apiserver' to switch the host and control plane cluster.
+
+To manage your member clusters, run:
+  export KUBECONFIG="$HOME/.kube/members.config"
+Please use 'kubectl config use-context member1/member2/member3' to switch to the different member cluster.
 ```
 
-There are two contexts you can switch after the script run are:
+There are two contexts in Karmada:
 - karmada-apiserver `kubectl config use-context karmada-apiserver`
 - karmada-host `kubectl config use-context karmada-host`
 
-The `karmada-apiserver` is the **main kubeconfig** to be used when interacting with karamda control plane, while `karmada-host` is only used for debugging karmada installation with host cluster, you can check all clusters at any time by run: `kubectl config view` and switch by `kubectl config use-context [CONTEXT_NAME]`
+The `karmada-apiserver` is the **main kubeconfig** to be used when interacting with the Karmada control plane, while `karmada-host` is only used for debugging Karmada installation with the host cluster. You can check all clusters at any time by running: `kubectl config view`. To switch cluster contexts, run `kubectl config use-context [CONTEXT_NAME]`
 
-##### 3.2. I have present cluster for installing
-Before run the following script, please make sure you are in the node or master of the cluster to install:
-```
-# hack/remote-up-karmada.sh <kubeconfig> <context_name>
-```
-`kubeconfig` is your cluster's kubeconfig that you want to install to
 
-`context_name` is the name of context in 'kubeconfig'
+### Demo
 
-If everything goes well, at the end of the script output, you will see similar messages as follows:
-```
-Karmada is installed.
-
-Kubeconfig for karmada in file: /root/.kube/karmada.config, so you can run:
-  export KUBECONFIG="/root/.kube/karmada.config"
-Or use kubectl with --kubeconfig=/root/.kube/karmada.config
-Please use 'kubectl config use-context karmada-apiserver' to switch the cluster of karmada control plane
-And use 'kubectl config use-context your-host' for debugging karmada installation
-```
-#### Tips
-- Please make sure you can access google cloud registry: k8s.gcr.io
-- Install script will download golang package, if your server is in the mainland China, you may set go proxy like this `export GOPROXY=https://goproxy.cn`
-
-### Join member cluster
-In the following steps, we are going to create a member cluster and then join the cluster to
-karmada control plane.
-
-#### 1. Create member cluster
-We are going to create a cluster named `member1` and we want the `KUBECONFIG` file
-in `$HOME/.kube/karmada.config`. Run following command:
-```
-# hack/create-cluster.sh member1 $HOME/.kube/karmada.config
-```
-The script `hack/create-cluster.sh` will create a standalone cluster by kind.
-
-#### 2. Join member cluster to karmada control plane
-The command `karmadactl` will help to join the member cluster to karmada control plane,
-before that, we should switch to karmada apiserver:
-```
-# kubectl config use-context karmada-apiserver
-```
-
-Then, install `karmadactl` command and join the member cluster:
-```
-# go get github.com/karmada-io/karmada/cmd/karmadactl
-# karmadactl join member1 --cluster-kubeconfig=$HOME/.kube/karmada.config
-```
-The `karmadactl join` command will create a `Cluster` object to reflect the member cluster.
-
-### 3. Check member cluster status
-Now, check the member clusters from karmada control plane by following command:
-```
-# kubectl get clusters
-NAME      VERSION   MODE   READY   AGE
-member1   v1.20.2   Push   True    66s
-```
+![Demo](docs/images/sample-nginx.svg)
 
 ### Propagate application
-In the following steps, we are going to propagate a deployment by karmada.
+In the following steps, we are going to propagate a deployment by Karmada.
 
-#### 1. Create nginx deployment in karmada.
+#### 1. Create nginx deployment in Karmada.
 First, create a [deployment](samples/nginx/deployment.yaml) named `nginx`:
-```
-# kubectl create -f samples/nginx/deployment.yaml
+
+```bash
+kubectl create -f samples/nginx/deployment.yaml
 ```
 
 #### 2. Create PropagationPolicy that will propagate nginx to member cluster
-Then, we need create a policy to drive the deployment to our member cluster.
-```
-# kubectl create -f samples/nginx/propagationpolicy.yaml
+Then, we need to create a policy to propagate the deployment to our member cluster.
+
+```bash
+kubectl create -f samples/nginx/propagationpolicy.yaml
 ```
 
-#### 3. Check the deployment status from karmada
-You can check deployment status from karmada, don't need to access member cluster:
-```
-# kubectl get deployment
+#### 3. Check the deployment status from Karmada
+You can check deployment status from Karmada, don't need to access member cluster:
+
+```bash
+$ kubectl get deployment
 NAME    READY   UP-TO-DATE   AVAILABLE   AGE
-nginx   1/1     1            1           43s
+nginx   2/2     2            2           20s
 ```
+
+## Kubernetes compatibility
+
+|                       | Kubernetes 1.16 | Kubernetes 1.17 | Kubernetes 1.18 | Kubernetes 1.19 | Kubernetes 1.20 | Kubernetes 1.21 | Kubernetes 1.22 | Kubernetes 1.23 | Kubernetes 1.24 | Kubernetes 1.25 | Kubernetes 1.26 | Kubernetes 1.27 | Kubernetes 1.28 | Kubernetes 1.29 |
+|-----------------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|-----------------|
+| Karmada v1.7          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+| Karmada v1.8          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+| Karmada v1.9          | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+| Karmada HEAD (master) | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               | ✓               |
+
+Key:
+* `✓` Karmada and the Kubernetes version are exactly compatible.
+* `+` Karmada has features or API objects that may not be present in the Kubernetes version.
+* `-` The Kubernetes version has features or API objects that Karmada can't use.
 
 ## Meeting
 
 Regular Community Meeting:
-* Tuesday at 14:30 CST(China Standard Time)(biweekly). [Convert to your timezone.](https://www.thetimezoneconverter.com/?t=14%3A30&tz=GMT%2B8&)
+* Tuesday at 14:30 UTC+8 (Chinese)(biweekly). [Convert to your timezone](https://dateful.com/convert/utc8?t=1430).
+* Tuesday at 15:00 UTC+0 (English)(biweekly). [Convert to your timezone](https://dateful.com/convert/coordinated-universal-time-utc?t=15).
 
 Resources:
-- [Meeting notes and agenda](https://docs.google.com/document/d/1y6YLVC-v7cmVAdbjedoyR5WL0-q45DBRXTvz5_I7bkA/edit)
+- [Meeting Notes and Agenda](https://docs.google.com/document/d/1y6YLVC-v7cmVAdbjedoyR5WL0-q45DBRXTvz5_I7bkA/edit)
 - [Meeting Calendar](https://calendar.google.com/calendar/embed?src=karmadaoss%40gmail.com&ctz=Asia%2FShanghai) | [Subscribe](https://calendar.google.com/calendar/u/1?cid=a2FybWFkYW9zc0BnbWFpbC5jb20)
+- [Meeting Link](https://zoom.com/my/karmada)
 
 ## Contact
 
 If you have questions, feel free to reach out to us in the following ways:
 
 - [mailing list](https://groups.google.com/forum/#!forum/karmada)
-- [slack](https://join.slack.com/t/karmada-io/shared_invite/zt-omhy1wfa-LmAkCLfpDMnBjVXp3_U~0w)
+- [slack](https://cloud-native.slack.com/archives/C02MUF8QXUN) | [Join](https://slack.cncf.io/)
 - [twitter](https://twitter.com/karmada_io)
+
+## Talks and References
+
+|                  | Link                                                                                                                    |
+|------------------|-------------------------------------------------------------------------------------------------------------------------|
+| KubeCon(EU 2021) | [Beyond federation: automating multi-cloud workloads with K8s native APIs](https://www.youtube.com/watch?v=LJJoaGszBVk) |
+| KubeCon(EU 2022) | [Sailing Multi Cloud Traffic Management With Karmada](https://youtu.be/rzFbxeZQHWI)                                     |
+| KubeDay(Israel 2023)| [Simplifying Multi-cluster Kubernetes Management with Karmada](https://www.youtube.com/watch?v=WCrIhRNBZ9I) |
+| KubeCon(China 2023) | [Multi-Cloud Multi-Cluster HPA Helps Trip.com Group Deal with Business Downturn and Rapid Recovery](https://www.youtube.com/watch?v=uninSyVBKO4) |
+| KubeCon(China 2023) | [Break Through Cluster Boundaries to Autoscale Workloads Across Them on a Large Scale](https://www.youtube.com/watch?v=22W1yrEJjtQ) |
+| KubeCon(China 2023) | [Cross-Cluster Traffic Orchestration with eBPF](https://www.youtube.com/watch?v=e4GA5e-C7n0) |
+| KubeCon(China 2023) | [Non-Intrusively Enable OpenKruise and Argo Workflow in a Multi-Cluster Federation](https://www.youtube.com/watch?v=gcllTXRkz-E) |
+
+For blogs, please refer to [website](https://karmada.io/blog/).
 
 ## Contributing
 

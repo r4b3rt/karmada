@@ -21,10 +21,12 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/kind/pkg/errors"
@@ -61,9 +63,11 @@ func ensureNetwork(name string) error {
 
 	// Generate unique subnet per network based on the name
 	// obtained from the ULA fc00::/8 range
+	// Use the MTU configured for the docker default network
 	// Make N attempts with "probing" in case we happen to collide
 	subnet := generateULASubnetFromName(name, 0)
-	err = createNetworkNoDuplicates(name, subnet)
+	mtu := getDefaultNetworkMTU()
+	err = createNetworkNoDuplicates(name, subnet, mtu)
 	if err == nil {
 		// Success!
 		return nil
@@ -75,7 +79,7 @@ func ensureNetwork(name string) error {
 	// If it is, make more attempts below
 	if isIPv6UnavailableError(err) {
 		// only one attempt, IPAM is automatic in ipv4 only
-		return createNetworkNoDuplicates(name, "")
+		return createNetworkNoDuplicates(name, "", mtu)
 	}
 	if isPoolOverlapError(err) {
 		// pool overlap suggests perhaps another process created the network
@@ -97,7 +101,7 @@ func ensureNetwork(name string) error {
 	const maxAttempts = 5
 	for attempt := int32(1); attempt < maxAttempts; attempt++ {
 		subnet := generateULASubnetFromName(name, attempt)
-		err = createNetworkNoDuplicates(name, subnet)
+		err = createNetworkNoDuplicates(name, subnet, mtu)
 		if err == nil {
 			// success!
 			return nil
@@ -121,8 +125,8 @@ func ensureNetwork(name string) error {
 	return errors.New("exhausted attempts trying to find a non-overlapping subnet")
 }
 
-func createNetworkNoDuplicates(name, ipv6Subnet string) error {
-	if err := createNetwork(name, ipv6Subnet); err != nil && !isNetworkAlreadyExistsError(err) {
+func createNetworkNoDuplicates(name, ipv6Subnet string, mtu int) error {
+	if err := createNetwork(name, ipv6Subnet, mtu); err != nil && !isNetworkAlreadyExistsError(err) {
 		return err
 	}
 	_, err := removeDuplicateNetworks(name)
@@ -142,15 +146,33 @@ func removeDuplicateNetworks(name string) (bool, error) {
 	return len(networks) > 0, nil
 }
 
-func createNetwork(name, ipv6Subnet string) error {
-	if ipv6Subnet == "" {
-		return exec.Command("docker", "network", "create", "-d=bridge",
-			"-o", "com.docker.network.bridge.enable_ip_masquerade=true",
-			name).Run()
-	}
-	return exec.Command("docker", "network", "create", "-d=bridge",
+func createNetwork(name, ipv6Subnet string, mtu int) error {
+	args := []string{"network", "create", "-d=bridge",
 		"-o", "com.docker.network.bridge.enable_ip_masquerade=true",
-		"--ipv6", "--subnet", ipv6Subnet, name).Run()
+	}
+	if mtu > 0 {
+		args = append(args, "-o", fmt.Sprintf("com.docker.network.driver.mtu=%d", mtu))
+	}
+	if ipv6Subnet != "" {
+		args = append(args, "--ipv6", "--subnet", ipv6Subnet)
+	}
+	args = append(args, name)
+	return exec.Command("docker", args...).Run()
+}
+
+// getDefaultNetworkMTU obtains the MTU from the docker default network
+func getDefaultNetworkMTU() int {
+	cmd := exec.Command("docker", "network", "inspect", "bridge",
+		"-f", `{{ index .Options "com.docker.network.driver.mtu" }}`)
+	lines, err := exec.OutputLines(cmd)
+	if err != nil || len(lines) != 1 {
+		return 0
+	}
+	mtu, err := strconv.Atoi(lines[0])
+	if err != nil {
+		return 0
+	}
+	return mtu
 }
 
 func sortedNetworksWithName(name string) ([]string, error) {
@@ -239,12 +261,22 @@ func checkIfNetworkExists(name string) (bool, error) {
 
 func isIPv6UnavailableError(err error) bool {
 	rerr := exec.RunErrorForError(err)
-	return rerr != nil && strings.HasPrefix(string(rerr.Output), "Error response from daemon: Cannot read IPv6 setup for bridge")
+	if rerr == nil {
+		return false
+	}
+	errorMessage := string(rerr.Output)
+	// we get this error when ipv6 was disabled in docker
+	const dockerIPV6DisabledError = "Error response from daemon: Cannot read IPv6 setup for bridge"
+	// TODO: this is fragile, and only necessary due to docker enabling ipv6 by default
+	// even on hosts that lack ip6tables setup.
+	// Preferably users would either have ip6tables setup properly or else disable ipv6 in docker
+	const dockerIPV6TablesError = "Error response from daemon: Failed to Setup IP tables: Unable to enable NAT rule:  (iptables failed: ip6tables"
+	return strings.HasPrefix(errorMessage, dockerIPV6DisabledError) || strings.HasPrefix(errorMessage, dockerIPV6TablesError)
 }
 
 func isPoolOverlapError(err error) bool {
 	rerr := exec.RunErrorForError(err)
-	return rerr != nil && strings.HasPrefix(string(rerr.Output), "Error response from daemon: Pool overlaps with other one on this address space")
+	return rerr != nil && strings.HasPrefix(string(rerr.Output), "Error response from daemon: Pool overlaps with other one on this address space") || strings.Contains(string(rerr.Output), "networks have overlapping")
 }
 
 func isNetworkAlreadyExistsError(err error) bool {
@@ -253,7 +285,6 @@ func isNetworkAlreadyExistsError(err error) bool {
 }
 
 // returns true if:
-// - err is nil
 // - err only contains no such network errors
 func isOnlyErrorNoSuchNetwork(err error) bool {
 	rerr := exec.RunErrorForError(err)
@@ -269,7 +300,7 @@ func isOnlyErrorNoSuchNetwork(err error) bool {
 		} else if err != nil {
 			return false
 		}
-		// if the line begins with Eror: No such network: it's fine
+		// if the line begins with Error: No such network: it's fine
 		s := string(l)
 		if strings.HasPrefix(s, "Error: No such network:") {
 			continue

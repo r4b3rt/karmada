@@ -17,15 +17,31 @@ limitations under the License.
 package config
 
 import (
+	"fmt"
 	"net"
+	"regexp"
+	"strings"
 
 	"sigs.k8s.io/kind/pkg/errors"
+	"sigs.k8s.io/kind/pkg/internal/sets"
 )
+
+// similar to valid docker container names, but since we will prefix
+// and suffix this name, we can relax it a little
+// see NewContext() for usage
+// https://godoc.org/github.com/docker/docker/daemon/names#pkg-constants
+var validNameRE = regexp.MustCompile(`^[a-z0-9.-]+$`)
 
 // Validate returns a ConfigErrors with an entry for each problem
 // with the config, or nil if there are none
 func (c *Cluster) Validate() error {
 	errs := []error{}
+
+	// validate the name
+	if !validNameRE.MatchString(c.Name) {
+		errs = append(errs, errors.Errorf("'%s' is not a valid cluster name, cluster names must match `%s`",
+			c.Name, validNameRE.String()))
+	}
 
 	// the api server port only needs checking if we aren't picking a random one
 	// at runtime
@@ -36,17 +52,24 @@ func (c *Cluster) Validate() error {
 		}
 	}
 
-	// podSubnet should be a valid CIDR
-	if _, _, err := net.ParseCIDR(c.Networking.PodSubnet); err != nil {
-		errs = append(errs, errors.Wrapf(err, "invalid podSubnet"))
+	// ipFamily should be ipv4, ipv6, or dual
+	if c.Networking.IPFamily != IPv4Family && c.Networking.IPFamily != IPv6Family && c.Networking.IPFamily != DualStackFamily {
+		errs = append(errs, errors.Errorf("invalid ipFamily: %s", c.Networking.IPFamily))
 	}
+
+	// podSubnet should be a valid CIDR
+	if err := validateSubnets(c.Networking.PodSubnet, c.Networking.IPFamily); err != nil {
+		errs = append(errs, errors.Errorf("invalid pod subnet %v", err))
+	}
+
 	// serviceSubnet should be a valid CIDR
-	if _, _, err := net.ParseCIDR(c.Networking.ServiceSubnet); err != nil {
-		errs = append(errs, errors.Wrapf(err, "invalid serviceSubnet"))
+	if err := validateSubnets(c.Networking.ServiceSubnet, c.Networking.IPFamily); err != nil {
+		errs = append(errs, errors.Errorf("invalid service subnet %v", err))
 	}
 
 	// KubeProxyMode should be iptables or ipvs
-	if c.Networking.KubeProxyMode != IPTablesMode && c.Networking.KubeProxyMode != IPVSMode {
+	if c.Networking.KubeProxyMode != IPTablesProxyMode && c.Networking.KubeProxyMode != IPVSProxyMode &&
+		c.Networking.KubeProxyMode != NoneProxyMode && c.Networking.KubeProxyMode != NFTablesProxyMode {
 		errs = append(errs, errors.Errorf("invalid kubeProxyMode: %s", c.Networking.KubeProxyMode))
 	}
 
@@ -101,15 +124,81 @@ func (n *Node) Validate() error {
 		if err := validatePort(mapping.HostPort); err != nil {
 			errs = append(errs, errors.Wrapf(err, "invalid hostPort"))
 		}
+
 		if err := validatePort(mapping.ContainerPort); err != nil {
 			errs = append(errs, errors.Wrapf(err, "invalid containerPort"))
 		}
+	}
+
+	if err := validatePortMappings(n.ExtraPortMappings); err != nil {
+		errs = append(errs, errors.Wrapf(err, "invalid portMapping"))
 	}
 
 	if len(errs) > 0 {
 		return errors.NewAggregate(errs)
 	}
 
+	return nil
+}
+
+func validatePortMappings(portMappings []PortMapping) error {
+	errMsg := "port mapping with same listen address, port and protocol already configured"
+
+	wildcardAddrIPv4 := net.ParseIP("0.0.0.0")
+	wildcardAddrIPv6 := net.ParseIP("::")
+
+	// bindMap has the following key-value structure
+	// PORT/PROTOCOL: [ IP ]
+	// { 80/TCP: [ 127.0.0.1, 192.168.2.3 ], 80/UDP: [ 0.0.0.0 ] }
+	bindMap := make(map[string]sets.String)
+
+	formatPortProtocol := func(port int32, protocol PortMappingProtocol) string {
+		return fmt.Sprintf("%d/%s", port, protocol)
+	}
+
+	for _, portMapping := range portMappings {
+		if portMapping.HostPort == -1 || portMapping.HostPort == 0 {
+			// Port -1 and 0 cause a random port to be selected, thus duplicates are allowed
+			continue
+		}
+
+		addr := net.ParseIP(portMapping.ListenAddress)
+		addrString := addr.String()
+
+		portProtocol := formatPortProtocol(portMapping.HostPort, portMapping.Protocol)
+		possibleErr := fmt.Errorf("%s: %s:%s", errMsg, addrString, portProtocol)
+
+		// in golang 0.0.0.0 and [::] are equivalent, convert [::] -> 0.0.0.0
+		// https://github.com/golang/go/issues/48723
+		if addr.Equal(wildcardAddrIPv6) {
+			addr = wildcardAddrIPv4
+			addrString = addr.String()
+		}
+
+		if _, ok := bindMap[portProtocol]; ok {
+
+			// wildcard address case:
+			// return error if there already exists any listen address for same port and protocol
+			if addr.Equal(wildcardAddrIPv4) {
+				if bindMap[portProtocol].Len() > 0 {
+					return possibleErr
+				}
+			}
+
+			// direct duplicate & wild card present check:
+			// return error if same combination of ip, port and protocol already exists in bindMap.
+			// return error if wildcard address is already present for same port & protocol
+			if bindMap[portProtocol].Has(addrString) || bindMap[portProtocol].Has(wildcardAddrIPv4.String()) {
+				return possibleErr
+			}
+		} else {
+			// initialize the set
+			bindMap[portProtocol] = sets.NewString()
+		}
+
+		// add the entry to bindMap
+		bindMap[portProtocol].Insert(addrString)
+	}
 	return nil
 }
 
@@ -120,4 +209,73 @@ func validatePort(port int32) error {
 		return errors.Errorf("invalid port number: %d", port)
 	}
 	return nil
+}
+
+func validateSubnets(subnetStr string, ipFamily ClusterIPFamily) error {
+	allErrs := []error{}
+
+	cidrsString := strings.Split(subnetStr, ",")
+	subnets := make([]*net.IPNet, 0, len(cidrsString))
+	for _, cidrString := range cidrsString {
+		_, cidr, err := net.ParseCIDR(cidrString)
+		if err != nil {
+			return fmt.Errorf("failed to parse cidr value:%q with error: %v", cidrString, err)
+		}
+		subnets = append(subnets, cidr)
+	}
+
+	dualstack := ipFamily == DualStackFamily
+	switch {
+	// if no subnets are defined
+	case len(subnets) == 0:
+		allErrs = append(allErrs, errors.New("no subnets defined"))
+	// if DualStack only 2 CIDRs allowed
+	case dualstack && len(subnets) > 2:
+		allErrs = append(allErrs, errors.New("expected one (IPv4 or IPv6) CIDR or two CIDRs from each family for dual-stack networking"))
+	// if DualStack and there are 2 CIDRs validate if there is at least one of each IP family
+	case dualstack && len(subnets) == 2:
+		areDualStackCIDRs, err := isDualStackCIDRs(subnets)
+		if err != nil {
+			allErrs = append(allErrs, err)
+		} else if !areDualStackCIDRs {
+			allErrs = append(allErrs, errors.New("expected one (IPv4 or IPv6) CIDR or two CIDRs from each family for dual-stack networking"))
+		}
+	// if not DualStack only one CIDR allowed
+	case !dualstack && len(subnets) > 1:
+		allErrs = append(allErrs, errors.New("only one CIDR allowed for single-stack networking"))
+	case ipFamily == IPv4Family && subnets[0].IP.To4() == nil:
+		allErrs = append(allErrs, errors.New("expected IPv4 CIDR for IPv4 family"))
+	case ipFamily == IPv6Family && subnets[0].IP.To4() != nil:
+		allErrs = append(allErrs, errors.New("expected IPv6 CIDR for IPv6 family"))
+	}
+
+	if len(allErrs) > 0 {
+		return errors.NewAggregate(allErrs)
+	}
+	return nil
+}
+
+// isDualStackCIDRs returns if
+// - all are valid cidrs
+// - at least one cidr from each family (v4 or v6)
+func isDualStackCIDRs(cidrs []*net.IPNet) (bool, error) {
+	v4Found := false
+	v6Found := false
+	for _, cidr := range cidrs {
+		if cidr == nil {
+			return false, fmt.Errorf("cidr %v is invalid", cidr)
+		}
+
+		if v4Found && v6Found {
+			continue
+		}
+
+		if cidr.IP != nil && cidr.IP.To4() == nil {
+			v6Found = true
+			continue
+		}
+		v4Found = true
+	}
+
+	return v4Found && v6Found, nil
 }

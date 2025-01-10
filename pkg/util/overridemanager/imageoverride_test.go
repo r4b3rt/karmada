@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package overridemanager
 
 import (
@@ -121,6 +137,37 @@ func generateReplicaSetYaml() *unstructured.Unstructured {
 							}}}}}}}
 }
 
+func generateDaemonSetYaml() *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "apps/v1",
+			"kind":       "DaemonSet",
+			"metadata": map[string]interface{}{
+				"name": "nginx",
+				"labels": map[string]interface{}{
+					"app": "nginx",
+				},
+			},
+			"spec": map[string]interface{}{
+				"selector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						"app": "nginx",
+					},
+				},
+				"template": map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"labels": map[string]interface{}{
+							"app": "nginx",
+						},
+					},
+					"spec": map[string]interface{}{
+						"containers": []interface{}{
+							map[string]interface{}{
+								"image": "fictional.registry.example/imagename:v1.0.0",
+								"name":  "nginx",
+							}}}}}}}
+}
+
 func generateDeploymentYamlWithTwoContainer() *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -152,9 +199,28 @@ func generateDeploymentYamlWithTwoContainer() *unstructured.Unstructured {
 								"name":  "nginx",
 							},
 							map[string]interface{}{
-								"image": "k8s.gcr.io/nginx-slim:0.8",
+								"image": "registry.k8s.io/nginx-slim:0.8",
 								"name":  "nginx",
 							}}}}}}}
+}
+
+func generateJobYaml() *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "batch/v1",
+			"kind":       "Job",
+			"metadata": map[string]interface{}{
+				"name": "pi",
+			},
+			"spec": map[string]interface{}{
+				"template": map[string]interface{}{
+					"spec": map[string]interface{}{
+						"containers": []interface{}{
+							map[string]interface{}{
+								"image": "perl:5.34.0",
+								"name":  "perl",
+							},
+						}}}}}}
 }
 
 func TestParseJSONPatchesByImageOverrider(t *testing.T) {
@@ -169,18 +235,59 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 		wantErr bool
 	}{
 		{
+			name: "imageOverrider with empty predicate, resource kind: Job, component: Registry, operator: add",
+			args: args{
+				rawObj: generateJobYaml(),
+				imageOverrider: &policyv1alpha1.ImageOverrider{
+					Component: "Registry",
+					Operator:  policyv1alpha1.OverriderOpAdd,
+					Value:     "registry.k8s.io",
+				},
+			},
+			want: []overrideOption{
+				{
+					Op:    string(policyv1alpha1.OverriderOpReplace),
+					Path:  "/spec/template/spec/containers/0/image",
+					Value: "registry.k8s.io/perl:5.34.0",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "imageOverrider with predicate, resource kind: Job, component: Registry, operator: add",
+			args: args{
+				rawObj: generateJobYaml(),
+				imageOverrider: &policyv1alpha1.ImageOverrider{
+					Predicate: &policyv1alpha1.ImagePredicate{
+						Path: "/spec/template/spec/containers/0/image",
+					},
+					Component: "Registry",
+					Operator:  policyv1alpha1.OverriderOpAdd,
+					Value:     "registry.k8s.io",
+				},
+			},
+			want: []overrideOption{
+				{
+					Op:    string(policyv1alpha1.OverriderOpReplace),
+					Path:  "/spec/template/spec/containers/0/image",
+					Value: "registry.k8s.io/perl:5.34.0",
+				},
+			},
+			wantErr: false,
+		},
+		{
 			name: "imageOverrider with empty predicate, resource kind: Deployment, component: Registry, operator: add",
 			args: args{
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Registry",
-					Operator:  "add",
+					Operator:  policyv1alpha1.OverriderOpAdd,
 					Value:     ".test",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example.test/imagename:v1.0.0",
 				},
@@ -193,13 +300,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Registry",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "fictional.registry.us",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.us/imagename:v1.0.0",
 				},
@@ -212,13 +319,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Registry",
-					Operator:  "remove",
+					Operator:  policyv1alpha1.OverriderOpRemove,
 					Value:     "fictional.registry.us",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "imagename:v1.0.0",
 				},
@@ -231,13 +338,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "add",
+					Operator:  policyv1alpha1.OverriderOpAdd,
 					Value:     "/nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/imagename/nginx:v1.0.0",
 				},
@@ -250,13 +357,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
@@ -269,13 +376,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "remove",
+					Operator:  policyv1alpha1.OverriderOpRemove,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/:v1.0.0",
 				},
@@ -288,13 +395,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Tag",
-					Operator:  "add",
+					Operator:  policyv1alpha1.OverriderOpAdd,
 					Value:     "sha256:dbcc1c35ac38df41fd2f5e4130b32ffdb93ebae8b3dbe638c23575912276fc9c",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/imagename:v1.0.0", // only one of tag and digest is valid.
 				},
@@ -307,13 +414,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Tag",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "sha256:dbcc1c35ac38df41fd2f5e4130b32ffdb93ebae8b3dbe638c23575912276fc9c",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/imagename@sha256:dbcc1c35ac38df41fd2f5e4130b32ffdb93ebae8b3dbe638c23575912276fc9c",
 				},
@@ -326,13 +433,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Tag",
-					Operator:  "remove",
+					Operator:  policyv1alpha1.OverriderOpRemove,
 					Value:     "sha256:dbcc1c35ac38df41fd2f5e4130b32ffdb93ebae8b3dbe638c23575912276fc9c",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/imagename",
 				},
@@ -345,13 +452,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generatePodYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
@@ -364,13 +471,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateStatefulSetYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
@@ -383,13 +490,32 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateReplicaSetYaml(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
+					Path:  "/spec/template/spec/containers/0/image",
+					Value: "fictional.registry.example/nginx:v1.0.0",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "imageOverrider with empty predicate, resource kind: DaemonSet",
+			args: args{
+				rawObj: generateDaemonSetYaml(),
+				imageOverrider: &policyv1alpha1.ImageOverrider{
+					Component: "Repository",
+					Operator:  policyv1alpha1.OverriderOpReplace,
+					Value:     "nginx",
+				},
+			},
+			want: []overrideOption{
+				{
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
@@ -402,20 +528,20 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 				rawObj: generateDeploymentYamlWithTwoContainer(),
 				imageOverrider: &policyv1alpha1.ImageOverrider{
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/1/image",
-					Value: "k8s.gcr.io/nginx:0.8",
+					Value: "registry.k8s.io/nginx:0.8",
 				},
 			},
 			wantErr: false,
@@ -429,13 +555,13 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 						Path: "/spec/template/spec/containers/0/image",
 					},
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/0/image",
 					Value: "fictional.registry.example/nginx:v1.0.0",
 				},
@@ -451,15 +577,15 @@ func TestParseJSONPatchesByImageOverrider(t *testing.T) {
 						Path: "/spec/template/spec/containers/1/image",
 					},
 					Component: "Repository",
-					Operator:  "replace",
+					Operator:  policyv1alpha1.OverriderOpReplace,
 					Value:     "nginx",
 				},
 			},
 			want: []overrideOption{
 				{
-					Op:    "replace",
+					Op:    string(policyv1alpha1.OverriderOpReplace),
 					Path:  "/spec/template/spec/containers/1/image",
-					Value: "k8s.gcr.io/nginx:0.8",
+					Value: "registry.k8s.io/nginx:0.8",
 				},
 			},
 			wantErr: false,

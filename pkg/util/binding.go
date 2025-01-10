@@ -1,59 +1,112 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
-	"context"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"k8s.io/apimachinery/pkg/util/sets"
 
-	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 )
 
 // GetBindingClusterNames will get clusterName list from bind clusters field
-func GetBindingClusterNames(binding *workv1alpha1.ResourceBinding) []string {
+func GetBindingClusterNames(spec *workv1alpha2.ResourceBindingSpec) []string {
 	var clusterNames []string
-	for _, targetCluster := range binding.Spec.Clusters {
+	for _, targetCluster := range spec.Clusters {
 		clusterNames = append(clusterNames, targetCluster.Name)
 	}
 	return clusterNames
 }
 
-// CreateOrUpdateWork creates a Work object if not exist, or updates if it already exist.
-func CreateOrUpdateWork(client client.Client, objectMeta metav1.ObjectMeta, rawExtension []byte) error {
-	work := &workv1alpha1.Work{
-		ObjectMeta: objectMeta,
-		Spec: workv1alpha1.WorkSpec{
-			Workload: workv1alpha1.WorkloadTemplate{
-				Manifests: []workv1alpha1.Manifest{
-					{
-						RawExtension: runtime.RawExtension{
-							Raw: rawExtension,
-						},
-					},
-				},
-			},
-		},
+// IsBindingReplicasChanged will check if the sum of replicas is different from the replicas of object
+func IsBindingReplicasChanged(bindingSpec *workv1alpha2.ResourceBindingSpec, strategy *policyv1alpha1.ReplicaSchedulingStrategy) bool {
+	if strategy == nil {
+		return false
+	}
+	if strategy.ReplicaSchedulingType == policyv1alpha1.ReplicaSchedulingTypeDuplicated {
+		for _, targetCluster := range bindingSpec.Clusters {
+			if targetCluster.Replicas != bindingSpec.Replicas {
+				return true
+			}
+		}
+		return false
+	}
+	if strategy.ReplicaSchedulingType == policyv1alpha1.ReplicaSchedulingTypeDivided {
+		replicasSum := GetSumOfReplicas(bindingSpec.Clusters)
+		return replicasSum != bindingSpec.Replicas
+	}
+	return false
+}
+
+// GetSumOfReplicas will get the sum of replicas in target clusters
+func GetSumOfReplicas(clusters []workv1alpha2.TargetCluster) int32 {
+	replicasSum := int32(0)
+	for i := range clusters {
+		replicasSum += clusters[i].Replicas
+	}
+	return replicasSum
+}
+
+// ConvertToClusterNames will convert a cluster slice to clusterName's sets.String
+func ConvertToClusterNames(clusters []workv1alpha2.TargetCluster) sets.Set[string] {
+	clusterNames := sets.New[string]()
+	for _, cluster := range clusters {
+		clusterNames.Insert(cluster.Name)
 	}
 
-	runtimeObject := work.DeepCopy()
-	operationResult, err := controllerutil.CreateOrUpdate(context.TODO(), client, runtimeObject, func() error {
-		runtimeObject.Spec = work.Spec
-		return nil
-	})
-	if err != nil {
-		klog.Errorf("Failed to create/update work %s/%s. Error: %v", work.GetNamespace(), work.GetName(), err)
-		return err
-	}
+	return clusterNames
+}
 
-	if operationResult == controllerutil.OperationResultCreated {
-		klog.Infof("Create work %s/%s successfully.", work.GetNamespace(), work.GetName())
-	} else if operationResult == controllerutil.OperationResultUpdated {
-		klog.Infof("Update work %s/%s successfully.", work.GetNamespace(), work.GetName())
-	} else {
-		klog.V(2).Infof("Work %s/%s is up to date.", work.GetNamespace(), work.GetName())
+// MergeTargetClusters will merge the replicas in two TargetCluster
+func MergeTargetClusters(oldCluster, newCluster []workv1alpha2.TargetCluster) []workv1alpha2.TargetCluster {
+	switch {
+	case len(oldCluster) == 0:
+		return newCluster
+	case len(newCluster) == 0:
+		return oldCluster
 	}
-	return nil
+	// oldMap is a map of the result for the old replicas so that it can be merged with the new result easily
+	oldMap := make(map[string]int32)
+	for _, cluster := range oldCluster {
+		oldMap[cluster.Name] = cluster.Replicas
+	}
+	// merge the new replicas and the data of old replicas
+	for i, cluster := range newCluster {
+		value, ok := oldMap[cluster.Name]
+		if ok {
+			newCluster[i].Replicas = cluster.Replicas + value
+			delete(oldMap, cluster.Name)
+		}
+	}
+	for key, value := range oldMap {
+		newCluster = append(newCluster, workv1alpha2.TargetCluster{Name: key, Replicas: value})
+	}
+	return newCluster
+}
+
+// RescheduleRequired judges whether reschedule is required.
+func RescheduleRequired(rescheduleTriggeredAt, lastScheduledTime *metav1.Time) bool {
+	if rescheduleTriggeredAt == nil {
+		return false
+	}
+	// lastScheduledTime is nil means first schedule haven't finished or yet keep failing, just wait for this schedule.
+	if lastScheduledTime == nil {
+		return false
+	}
+	return rescheduleTriggeredAt.After(lastScheduledTime.Time)
 }

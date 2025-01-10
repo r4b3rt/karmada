@@ -51,6 +51,7 @@ func convertv1alpha4Node(in *v1alpha4.Node, out *Node) {
 	out.Role = NodeRole(in.Role)
 	out.Image = in.Image
 
+	out.Labels = in.Labels
 	out.KubeadmConfigPatches = in.KubeadmConfigPatches
 	out.ExtraMounts = make([]Mount, len(in.ExtraMounts))
 	out.ExtraPortMappings = make([]PortMapping, len(in.ExtraPortMappings))
@@ -84,6 +85,7 @@ func convertv1alpha4Networking(in *v1alpha4.Networking, out *Networking) {
 	out.KubeProxyMode = ProxyMode(in.KubeProxyMode)
 	out.ServiceSubnet = in.ServiceSubnet
 	out.DisableDefaultCNI = in.DisableDefaultCNI
+	out.DNSSearch = in.DNSSearch
 }
 
 func convertv1alpha4Mount(in *v1alpha4.Mount, out *Mount) {

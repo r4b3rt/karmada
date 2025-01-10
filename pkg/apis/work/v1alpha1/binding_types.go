@@ -1,6 +1,23 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -8,7 +25,7 @@ import (
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=rb
+// +kubebuilder:resource:path=resourcebindings,scope=Namespaced,shortName=rb,categories={karmada-io}
 
 // ResourceBinding represents a binding of a kubernetes resource with a propagation policy.
 type ResourceBinding struct {
@@ -54,12 +71,23 @@ type ObjectReference struct {
 	// determine when object has changed.
 	// +optional
 	ResourceVersion string `json:"resourceVersion,omitempty"`
+
+	// ReplicaResourceRequirements represents the resources required by each replica.
+	// +optional
+	ReplicaResourceRequirements corev1.ResourceList `json:"resourcePerReplicas,omitempty"`
+
+	// Replicas represents the replica number of the referencing resource.
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
 }
 
 // TargetCluster represents the identifier of a member cluster.
 type TargetCluster struct {
 	// Name of target cluster.
 	Name string `json:"name"`
+	// Replicas in target cluster
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
 }
 
 // ResourceBindingStatus represents the overall status of the strategy as well as the referenced resources.
@@ -75,11 +103,22 @@ type ResourceBindingStatus struct {
 // AggregatedStatusItem represents status of the resource running in a member cluster.
 type AggregatedStatusItem struct {
 	// ClusterName represents the member cluster name which the resource deployed on.
+	// +required
 	ClusterName string `json:"clusterName"`
 
 	// Status reflects running status of current manifest.
 	// +kubebuilder:pruning:PreserveUnknownFields
-	Status runtime.RawExtension `json:",inline"`
+	// +optional
+	Status *runtime.RawExtension `json:"status,omitempty"`
+	// Applied represents if the resource referencing by ResourceBinding or ClusterResourceBinding
+	// is successfully applied on the cluster.
+	// +optional
+	Applied bool `json:"applied,omitempty"`
+
+	// AppliedMessage is a human readable message indicating details about the applied status.
+	// This is usually holds the error message in case of apply failed.
+	// +optional
+	AppliedMessage string `json:"appliedMessage,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -96,7 +135,7 @@ type ResourceBindingList struct {
 // +genclient
 // +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-// +kubebuilder:resource:scope="Cluster",shortName=crb
+// +kubebuilder:resource:path=clusterresourcebindings,scope="Cluster",shortName=crb,categories={karmada-io}
 // +kubebuilder:subresource:status
 
 // ClusterResourceBinding represents a binding of a kubernetes resource with a ClusterPropagationPolicy.
@@ -112,7 +151,6 @@ type ClusterResourceBinding struct {
 	Status ResourceBindingStatus `json:"status,omitempty"`
 }
 
-// +kubebuilder:resource:scope="Cluster"
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ClusterResourceBindingList contains a list of ClusterResourceBinding.
