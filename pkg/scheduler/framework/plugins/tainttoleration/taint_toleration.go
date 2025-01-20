@@ -1,14 +1,30 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package tainttoleration
 
 import (
 	"context"
 	"fmt"
 
-	v1 "k8s.io/api/core/v1"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	corev1 "k8s.io/api/core/v1"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
 
-	cluster "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
-	"github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
+	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 	"github.com/karmada-io/karmada/pkg/scheduler/framework"
 )
 
@@ -21,11 +37,10 @@ const (
 type TaintToleration struct{}
 
 var _ framework.FilterPlugin = &TaintToleration{}
-var _ framework.ScorePlugin = &TaintToleration{}
 
 // New instantiates the TaintToleration plugin.
-func New() framework.Plugin {
-	return &TaintToleration{}
+func New() (framework.Plugin, error) {
+	return &TaintToleration{}, nil
 }
 
 // Name returns the plugin name.
@@ -34,23 +49,27 @@ func (p *TaintToleration) Name() string {
 }
 
 // Filter checks if the given tolerations in placement tolerate cluster's taints.
-func (p *TaintToleration) Filter(ctx context.Context, placement *v1alpha1.Placement, cluster *cluster.Cluster) *framework.Result {
-	filterPredicate := func(t *v1.Taint) bool {
-		// now only interested in NoSchedule taint which means do not allow new resource to schedule onto the cluster unless they tolerate the taint
-		// todo: supprot NoExecute taint
-		return t.Effect == v1.TaintEffectNoSchedule
+func (p *TaintToleration) Filter(
+	_ context.Context,
+	bindingSpec *workv1alpha2.ResourceBindingSpec,
+	_ *workv1alpha2.ResourceBindingStatus,
+	cluster *clusterv1alpha1.Cluster,
+) *framework.Result {
+	// skip the filter if the cluster is already in the list of scheduling results,
+	// if the workload referencing by the binding can't tolerate the taint,
+	// the taint-manager will evict it after a graceful period.
+	if bindingSpec.TargetContains(cluster.Name) {
+		return framework.NewResult(framework.Success)
 	}
 
-	taint, isUntolerated := v1helper.FindMatchingUntoleratedTaint(cluster.Spec.Taints, placement.ClusterTolerations, filterPredicate)
+	filterPredicate := func(t *corev1.Taint) bool {
+		return t.Effect == corev1.TaintEffectNoSchedule || t.Effect == corev1.TaintEffectNoExecute
+	}
+
+	taint, isUntolerated := v1helper.FindMatchingUntoleratedTaint(cluster.Spec.Taints, bindingSpec.Placement.ClusterTolerations, filterPredicate)
 	if !isUntolerated {
 		return framework.NewResult(framework.Success)
 	}
 
-	return framework.NewResult(framework.Unschedulable, fmt.Sprintf("cluster had taint {%s: %s}, that the propagation policy didn't tolerate",
-		taint.Key, taint.Value))
-}
-
-// Score calculates the score on the candidate cluster.
-func (p *TaintToleration) Score(ctx context.Context, placement *v1alpha1.Placement, cluster *cluster.Cluster) (float64, *framework.Result) {
-	return 0, framework.NewResult(framework.Success)
+	return framework.NewResult(framework.Unschedulable, fmt.Sprintf("cluster(s) had untolerated taint {%s}", taint.ToString()))
 }

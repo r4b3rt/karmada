@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package imageparser
 
 import (
@@ -5,7 +21,7 @@ import (
 	_ "crypto/sha512" // initialize crypto/sha512 to enable sha512 algorithm
 	"strings"
 
-	"github.com/distribution/distribution/v3/reference"
+	"github.com/distribution/reference"
 )
 
 // Components make up a whole image.
@@ -13,7 +29,7 @@ import (
 // fictional.registry.example:10443/karmada/karmada-controller-manager:v1.0.0 or
 // fictional.registry.example:10443/karmada/karmada-controller-manager@sha256:50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c
 type Components struct {
-	// hostname is the prefix of referencing image, like "k8s.gcr.io".
+	// hostname is the prefix of referencing image, like "registry.k8s.io".
 	// It may optionally be followed by a port number, like "fictional.registry.example:10443".
 	hostname string
 	// repository is the short name of referencing image, like "karmada-controller-manager".
@@ -162,7 +178,7 @@ func Parse(image string) (*Components, error) {
 	return comp, nil
 }
 
-// SplitHostname splits a repository name(ie: k8s.gcr.io/kube-apiserver) to hostname(k8s.gcr.io) and remotename(kube-apiserver) string.
+// SplitHostname splits a repository name(ie: registry.k8s.io/kube-apiserver) to hostname(registry.k8s.io) and remotename(kube-apiserver) string.
 func SplitHostname(name string) (hostname, remoteName string) {
 	i := strings.IndexRune(name, '/')
 	if i == -1 || (!strings.ContainsAny(name[:i], ".:") && name[:i] != "localhost") {

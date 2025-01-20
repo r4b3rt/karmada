@@ -17,6 +17,7 @@ limitations under the License.
 package docker
 
 import (
+	"encoding/json"
 	"strings"
 
 	"sigs.k8s.io/kind/pkg/exec"
@@ -48,15 +49,52 @@ func usernsRemap() bool {
 }
 
 // mountDevMapper checks if the Docker storage driver is Btrfs or ZFS
+// or if the backing filesystem is Btrfs
 func mountDevMapper() bool {
 	storage := ""
+	// check the docker storage driver
 	cmd := exec.Command("docker", "info", "-f", "{{.Driver}}")
 	lines, err := exec.OutputLines(cmd)
+	if err != nil || len(lines) != 1 {
+		return false
+	}
+
+	storage = strings.ToLower(strings.TrimSpace(lines[0]))
+	if storage == "btrfs" || storage == "zfs" || storage == "devicemapper" {
+		return true
+	}
+
+	// check the backing file system
+	// docker info -f '{{json .DriverStatus  }}'
+	// [["Backing Filesystem","extfs"],["Supports d_type","true"],["Native Overlay Diff","true"]]
+	cmd = exec.Command("docker", "info", "-f", "{{json .DriverStatus }}")
+	lines, err = exec.OutputLines(cmd)
+	if err != nil || len(lines) != 1 {
+		return false
+	}
+	var dat [][]string
+	if err := json.Unmarshal([]byte(lines[0]), &dat); err != nil {
+		return false
+	}
+	for _, item := range dat {
+		if item[0] == "Backing Filesystem" {
+			storage = strings.ToLower(item[1])
+			break
+		}
+	}
+
+	return storage == "btrfs" || storage == "zfs" || storage == "xfs"
+}
+
+// rootless: use fuse-overlayfs by default
+// https://github.com/kubernetes-sigs/kind/issues/2275
+func mountFuse() bool {
+	i, err := info()
 	if err != nil {
 		return false
 	}
-	if len(lines) > 0 {
-		storage = strings.ToLower(strings.TrimSpace(lines[0]))
+	if i != nil && i.Rootless {
+		return true
 	}
-	return storage == "btrfs" || storage == "zfs"
+	return false
 }

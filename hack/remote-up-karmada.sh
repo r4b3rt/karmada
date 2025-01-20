@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2021 The Karmada Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -o errexit
 set -o nounset
@@ -6,11 +20,16 @@ set -o pipefail
 
 function usage() {
   echo "This script will deploy karmada control plane to a given cluster."
-  echo "Usage: hack/remote-up-karmada.sh <KUBECONFIG> <CONTEXT_NAME>"
+  echo "Usage: hack/remote-up-karmada.sh <KUBECONFIG> <CONTEXT_NAME> [LOAD_BALANCER]"
   echo "Example: hack/remote-up-karmada.sh ~/.kube/config karmada-host"
+  echo -e "Parameters:\n\tKUBECONFIG\tYour cluster's kubeconfig that you want to install to"
+  echo -e "\tCONTEXT_NAME\tThe name of context in 'kubeconfig'"
+  echo -e "\tLOAD_BALANCER\tThis option default is 'false', and there will directly use 'hostNetwork' to communicate
+  \t\t\toutside the karmada-host cluster
+  \t\t\tif you want to create a 'LoadBalancer' type service for karmada apiserver, set as 'true'."
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -lt 2 ]]; then
   usage
   exit 1
 fi
@@ -33,14 +52,25 @@ then
   exit 1
 fi
 
+if [ "${3:-false}" = true ]; then
+  LOAD_BALANCER=true
+  export LOAD_BALANCER
+fi
+
 # deploy karmada control plane
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-"${SCRIPT_ROOT}"/hack/deploy-karmada.sh "${HOST_CLUSTER_KUBECONFIG}" "${HOST_CLUSTER_NAME}"
-kubectl config use-context karmada-apiserver --kubeconfig="${HOST_CLUSTER_KUBECONFIG}"
+source "${SCRIPT_ROOT}"/hack/util.sh
+
+# proxy setting in China mainland
+if [[ -n ${CHINA_MAINLAND:-} ]]; then
+  util::set_mirror_registry_for_china_mainland ${SCRIPT_ROOT}
+fi
+
+"${SCRIPT_ROOT}"/hack/deploy-karmada.sh "${HOST_CLUSTER_KUBECONFIG}" "${HOST_CLUSTER_NAME}" "remote"
 
 function print_success() {
-  echo
-  echo "Karmada is installed."
+  echo -e "$KARMADA_GREETING"
+  echo "Karmada is installed successfully."
   echo
   echo "Kubeconfig for karmada in file: ${HOST_CLUSTER_KUBECONFIG}, so you can run:"
   echo "  export KUBECONFIG=\"${HOST_CLUSTER_KUBECONFIG}\""

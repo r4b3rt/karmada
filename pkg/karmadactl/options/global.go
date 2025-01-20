@@ -1,31 +1,118 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package options
 
-import "github.com/spf13/pflag"
+import (
+	"fmt"
+	"time"
 
-// DefaultKarmadaClusterNamespace defines the default namespace where the member cluster objects are stored.
-// The secret owns by cluster objects will be stored in the namespace too.
+	"github.com/spf13/pflag"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+)
+
+// DefaultKarmadaClusterNamespace defines the default namespace where the member cluster secrets are stored.
 const DefaultKarmadaClusterNamespace = "karmada-cluster"
 
-// GlobalCommandOptions holds the configuration shared by the all sub-commands of `karmadactl`.
-type GlobalCommandOptions struct {
-	// KubeConfig holds the control plane KUBECONFIG file path.
-	KubeConfig string
+// DefaultHostClusterDomain defines the default cluster domain of karmada host cluster.
+const DefaultHostClusterDomain = "cluster.local"
 
-	// ClusterContext is the name of the cluster context in control plane KUBECONFIG file.
-	// Default value is the current-context.
-	KarmadaContext string
+// DefaultKarmadactlCommandDuration defines the default timeout for karmadactl execute
+const DefaultKarmadactlCommandDuration = 60 * time.Second
 
-	// ClusterNamespace holds the namespace name where the member cluster objects are stored.
-	ClusterNamespace string
+const (
+	// KarmadaCertsName the secret name of karmada certs
+	KarmadaCertsName = "karmada-cert"
+	// CaCertAndKeyName ca certificate cert/key name in karmada certs secret
+	CaCertAndKeyName = "ca"
+)
 
-	// DryRun tells if run the command in dry-run mode, without making any server requests.
-	DryRun bool
+// DefaultConfigFlags It composes the set of values necessary for obtaining a REST client config with default values set.
+var DefaultConfigFlags = genericclioptions.NewConfigFlags(true).WithDeprecatedPasswordFlag().WithDiscoveryBurst(300).WithDiscoveryQPS(50.0)
+
+// AddKubeConfigFlags adds flags to the specified FlagSet.
+func AddKubeConfigFlags(flags *pflag.FlagSet) {
+	flags.StringVar(DefaultConfigFlags.KubeConfig, "kubeconfig", *DefaultConfigFlags.KubeConfig, "Path to the kubeconfig file to use for CLI requests.")
+	flags.StringVar(DefaultConfigFlags.Context, "karmada-context", *DefaultConfigFlags.Context, "The name of the kubeconfig context to use")
 }
 
-// AddFlags adds flags to the specified FlagSet.
-func (o *GlobalCommandOptions) AddFlags(flags *pflag.FlagSet) {
-	flags.StringVar(&o.KubeConfig, "kubeconfig", "", "Path to the control plane kubeconfig file.")
-	flags.StringVar(&o.KarmadaContext, "karmada-context", "", "Name of the cluster context in control plane kubeconfig file.")
-	flags.StringVar(&o.ClusterNamespace, "cluster-namespace", DefaultKarmadaClusterNamespace, "Namespace in the control plane where member cluster are stored.")
-	flags.BoolVar(&o.DryRun, "dry-run", false, "Run the command in dry-run mode, without making any server requests.")
+// AddNamespaceFlag add namespace flag to the specified FlagSet.
+func AddNamespaceFlag(flags *pflag.FlagSet) {
+	flags.StringVarP(DefaultConfigFlags.Namespace, "namespace", "n", *DefaultConfigFlags.Namespace, "If present, the namespace scope for this CLI request.")
+}
+
+// OperationScope defines the operation scope of a command.
+type OperationScope string
+
+// String returns the string value of OperationScope
+func (o *OperationScope) String() string {
+	return string(*o)
+}
+
+// Set value to OperationScope
+func (o *OperationScope) Set(s string) error {
+	switch s {
+	case "":
+		return nil
+	case string(KarmadaControlPlane):
+		*o = KarmadaControlPlane
+		return nil
+	case string(Members):
+		*o = Members
+		return nil
+	case string(All):
+		*o = All
+		return nil
+	}
+	return fmt.Errorf("not support OperationScope: %s", s)
+}
+
+// Type returns type of OperationScope
+func (o *OperationScope) Type() string {
+	return "operationScope"
+}
+
+const (
+	// KarmadaControlPlane indicates the operation scope of a command is Karmada control plane.
+	KarmadaControlPlane OperationScope = "karmada"
+	// Members indicates the operation scope of a command is member clusters.
+	Members OperationScope = "members"
+	// All indicates the operation scope of a command contains Karmada control plane and member clusters.
+	All OperationScope = "all"
+)
+
+// VerifyOperationScopeFlags verifies whether the given operationScope is valid.
+func VerifyOperationScopeFlags(operationScope OperationScope, supportScope ...OperationScope) error {
+	if len(supportScope) == 0 {
+		supportScope = []OperationScope{KarmadaControlPlane, Members, All}
+	}
+	for _, scope := range supportScope {
+		if operationScope == scope {
+			return nil
+		}
+	}
+	return fmt.Errorf("not support operation scope: %s", operationScope)
+}
+
+// ContainKarmadaScope returns true if the given operationScope contains Karmada control plane.
+func ContainKarmadaScope(operationScope OperationScope) bool {
+	return operationScope == KarmadaControlPlane || operationScope == All
+}
+
+// ContainMembersScope returns true if the given operationScope contains member clusters.
+func ContainMembersScope(operationScope OperationScope) bool {
+	return operationScope == Members || operationScope == All
 }

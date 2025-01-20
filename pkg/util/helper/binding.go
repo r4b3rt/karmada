@@ -1,10 +1,29 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package helper
 
 import (
 	"context"
+	"crypto/rand"
+	"math/big"
 	"sort"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -14,31 +33,27 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
-	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
-	"github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
+	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	"github.com/karmada-io/karmada/pkg/events"
+	"github.com/karmada-io/karmada/pkg/features"
 	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/fedinformer/genericmanager"
+	"github.com/karmada-io/karmada/pkg/util/fedinformer/keys"
 	"github.com/karmada-io/karmada/pkg/util/names"
-	"github.com/karmada-io/karmada/pkg/util/overridemanager"
 	"github.com/karmada-io/karmada/pkg/util/restmapper"
-)
-
-const (
-	// SpecField indicates the 'spec' field of a deployment
-	SpecField = "spec"
-	// ReplicasField indicates the 'replicas' field of a deployment
-	ReplicasField = "replicas"
 )
 
 // ClusterWeightInfo records the weight of a cluster
 type ClusterWeightInfo struct {
-	ClusterName string
-	Weight      int64
+	ClusterName  string
+	Weight       int64
+	LastReplicas int32
 }
 
 // ClusterWeightInfoList is a slice of ClusterWeightInfo that implements sort.Interface to sort by Value.
@@ -50,60 +65,150 @@ func (p ClusterWeightInfoList) Less(i, j int) bool {
 	if p[i].Weight != p[j].Weight {
 		return p[i].Weight > p[j].Weight
 	}
-	return p[i].ClusterName < p[j].ClusterName
-}
-
-func sortClusterByWeight(m map[string]int64) ClusterWeightInfoList {
-	p := make(ClusterWeightInfoList, len(m))
-	i := 0
-	for k, v := range m {
-		p[i] = ClusterWeightInfo{k, v}
-		i++
+	// when weights is equal, sort by last scheduling replicas result,
+	// more last scheduling replicas means the remainders of the last scheduling were randomized to such clusters,
+	// so in order to keep the inertia in this scheduling, such clusters should also be prioritized
+	if p[i].LastReplicas != p[j].LastReplicas {
+		return p[i].LastReplicas > p[j].LastReplicas
 	}
-	sort.Sort(p)
-	return p
+	// when last scheduling replicas is also equal, sort by random,
+	// first generate a random number within [0, 100) range,
+	// then return < if the actual number is in [0, 50) range, return > if is in [50, 100) range
+	const maxRandomNum = 100
+	randomNum, err := rand.Int(rand.Reader, big.NewInt(maxRandomNum))
+	return err == nil && randomNum.Cmp(big.NewInt(maxRandomNum/2)) >= 0
 }
 
-// IsBindingReady will check if resourceBinding/clusterResourceBinding is ready to build Work.
-func IsBindingReady(targetClusters []workv1alpha1.TargetCluster) bool {
-	return len(targetClusters) != 0
-}
-
-// GetBindingClusterNames will get clusterName list from bind clusters field
-func GetBindingClusterNames(targetClusters []workv1alpha1.TargetCluster) []string {
-	var clusterNames []string
-	for _, targetCluster := range targetClusters {
-		clusterNames = append(clusterNames, targetCluster.Name)
+// GetWeightSum returns the sum of the weight info.
+func (p ClusterWeightInfoList) GetWeightSum() int64 {
+	var res int64
+	for i := range p {
+		res += p[i].Weight
 	}
+	return res
+}
+
+// Dispenser aims to divide replicas among clusters by different weights.
+type Dispenser struct {
+	// Target replicas, should be a positive integer.
+	NumReplicas int32
+	// Final result.
+	Result []workv1alpha2.TargetCluster
+}
+
+// NewDispenser will construct a dispenser with target replicas and a prescribed initial result.
+func NewDispenser(numReplicas int32, init []workv1alpha2.TargetCluster) *Dispenser {
+	cp := make([]workv1alpha2.TargetCluster, len(init))
+	copy(cp, init)
+	return &Dispenser{NumReplicas: numReplicas, Result: cp}
+}
+
+// Done indicates whether finish dispensing.
+func (a *Dispenser) Done() bool {
+	return a.NumReplicas == 0 && len(a.Result) != 0
+}
+
+// TakeByWeight divide replicas by a weight list and merge the result into previous result.
+func (a *Dispenser) TakeByWeight(w ClusterWeightInfoList) {
+	if a.Done() {
+		return
+	}
+	sum := w.GetWeightSum()
+	if sum == 0 {
+		return
+	}
+
+	sort.Sort(w)
+
+	result := make([]workv1alpha2.TargetCluster, 0, w.Len())
+	remain := a.NumReplicas
+	for _, info := range w {
+		replicas := int32(info.Weight * int64(a.NumReplicas) / sum)
+		result = append(result, workv1alpha2.TargetCluster{
+			Name:     info.ClusterName,
+			Replicas: replicas,
+		})
+		remain -= replicas
+	}
+	// TODO(Garrybest): take rest replicas by fraction part
+	for i := range result {
+		if remain == 0 {
+			break
+		}
+		result[i].Replicas++
+		remain--
+	}
+
+	a.NumReplicas = remain
+	a.Result = util.MergeTargetClusters(a.Result, result)
+}
+
+// GetStaticWeightInfoListByTargetClusters constructs a weight list by target cluster slice.
+func GetStaticWeightInfoListByTargetClusters(tcs, scheduled []workv1alpha2.TargetCluster) ClusterWeightInfoList {
+	weightList := make(ClusterWeightInfoList, 0, len(tcs))
+	for _, targetCluster := range tcs {
+		var lastReplicas int32
+		for _, scheduledCluster := range scheduled {
+			if targetCluster.Name == scheduledCluster.Name {
+				lastReplicas = scheduledCluster.Replicas
+				break
+			}
+		}
+		weightList = append(weightList, ClusterWeightInfo{
+			ClusterName:  targetCluster.Name,
+			Weight:       int64(targetCluster.Replicas),
+			LastReplicas: lastReplicas,
+		})
+	}
+	return weightList
+}
+
+// SpreadReplicasByTargetClusters divides replicas by the weight of a target cluster list.
+func SpreadReplicasByTargetClusters(numReplicas int32, tcs, init []workv1alpha2.TargetCluster) []workv1alpha2.TargetCluster {
+	weightList := GetStaticWeightInfoListByTargetClusters(tcs, init)
+	disp := NewDispenser(numReplicas, init)
+	disp.TakeByWeight(weightList)
+	return disp.Result
+}
+
+// IsBindingScheduled will check if resourceBinding/clusterResourceBinding is successfully scheduled.
+func IsBindingScheduled(status *workv1alpha2.ResourceBindingStatus) bool {
+	return meta.IsStatusConditionTrue(status.Conditions, workv1alpha2.Scheduled)
+}
+
+// ObtainBindingSpecExistingClusters will obtain the cluster slice existing in the binding's spec field.
+func ObtainBindingSpecExistingClusters(bindingSpec workv1alpha2.ResourceBindingSpec) sets.Set[string] {
+	clusterNames := util.ConvertToClusterNames(bindingSpec.Clusters)
+	for _, binding := range bindingSpec.RequiredBy {
+		for _, targetCluster := range binding.Clusters {
+			clusterNames.Insert(targetCluster.Name)
+		}
+	}
+
+	for _, task := range bindingSpec.GracefulEvictionTasks {
+		// EvictionTasks with Immediately PurgeMode should not be treated as existing clusters
+		// Work on those clusters should be removed immediately and treated as orphans
+		if task.PurgeMode != policyv1alpha1.Immediately {
+			clusterNames.Insert(task.FromCluster)
+		}
+	}
+
 	return clusterNames
 }
 
 // FindOrphanWorks retrieves all works that labeled with current binding(ResourceBinding or ClusterResourceBinding) objects,
 // then pick the works that not meet current binding declaration.
-func FindOrphanWorks(c client.Client, bindingNamespace, bindingName string, clusterNames []string, scope apiextensionsv1.ResourceScope) ([]workv1alpha1.Work, error) {
-	workList := &workv1alpha1.WorkList{}
-	if scope == apiextensionsv1.NamespaceScoped {
-		selector := labels.SelectorFromSet(labels.Set{
-			util.ResourceBindingNamespaceLabel: bindingNamespace,
-			util.ResourceBindingNameLabel:      bindingName,
-		})
-
-		if err := c.List(context.TODO(), workList, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-	} else {
-		selector := labels.SelectorFromSet(labels.Set{
-			util.ClusterResourceBindingLabel: bindingName,
-		})
-
-		if err := c.List(context.TODO(), workList, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
+func FindOrphanWorks(ctx context.Context, c client.Client, bindingNamespace, bindingName, bindingID string, expectClusters sets.Set[string]) ([]workv1alpha1.Work, error) {
+	var needJudgeWorks []workv1alpha1.Work
+	workList, err := GetWorksByBindingID(ctx, c, bindingID, bindingNamespace != "")
+	if err != nil {
+		klog.Errorf("Failed to get works by binding object (%s/%s): %v", bindingNamespace, bindingName, err)
+		return nil, err
 	}
+	needJudgeWorks = append(needJudgeWorks, workList.Items...)
 
 	var orphanWorks []workv1alpha1.Work
-	expectClusters := sets.NewString(clusterNames...)
-	for _, work := range workList.Items {
+	for _, work := range needJudgeWorks {
 		workTargetCluster, err := names.GetClusterName(work.GetNamespace())
 		if err != nil {
 			klog.Errorf("Failed to get cluster name which Work %s/%s belongs to. Error: %v.",
@@ -118,328 +223,258 @@ func FindOrphanWorks(c client.Client, bindingNamespace, bindingName string, clus
 }
 
 // RemoveOrphanWorks will remove orphan works.
-func RemoveOrphanWorks(c client.Client, works []workv1alpha1.Work) error {
+func RemoveOrphanWorks(ctx context.Context, c client.Client, works []workv1alpha1.Work) error {
+	var errs []error
 	for workIndex, work := range works {
-		err := c.Delete(context.TODO(), &works[workIndex])
+		err := c.Delete(ctx, &works[workIndex])
 		if err != nil {
-			return err
+			klog.Errorf("Failed to delete orphan work %s/%s, err is %v", work.GetNamespace(), work.GetName(), err)
+			errs = append(errs, err)
+			continue
 		}
 		klog.Infof("Delete orphan work %s/%s successfully.", work.GetNamespace(), work.GetName())
 	}
-	return nil
+	return errors.NewAggregate(errs)
 }
 
-// FetchWorkload fetches the kubernetes resource to be propagated.
-func FetchWorkload(dynamicClient dynamic.Interface, restMapper meta.RESTMapper, resource workv1alpha1.ObjectReference) (*unstructured.Unstructured, error) {
-	dynamicResource, err := restmapper.GetGroupVersionResource(restMapper,
-		schema.FromAPIVersionAndKind(resource.APIVersion, resource.Kind))
+// FetchResourceTemplate fetches the resource template to be propagated.
+// Any updates to this resource template are not recommended as it may come from the informer cache.
+// We should abide by the principle of making a deep copy first and then modifying it.
+// See issue: https://github.com/karmada-io/karmada/issues/3878.
+func FetchResourceTemplate(
+	ctx context.Context,
+	dynamicClient dynamic.Interface,
+	informerManager genericmanager.SingleClusterInformerManager,
+	restMapper meta.RESTMapper,
+	resource workv1alpha2.ObjectReference,
+) (*unstructured.Unstructured, error) {
+	gvr, err := restmapper.GetGroupVersionResource(restMapper, schema.FromAPIVersionAndKind(resource.APIVersion, resource.Kind))
 	if err != nil {
-		klog.Errorf("Failed to get GVR from GVK %s %s. Error: %v", resource.APIVersion,
-			resource.Kind, err)
+		klog.Errorf("Failed to get GVR from GVK(%s/%s), Error: %v", resource.APIVersion, resource.Kind, err)
 		return nil, err
 	}
 
-	workload, err := dynamicClient.Resource(dynamicResource).Namespace(resource.Namespace).Get(context.TODO(),
-		resource.Name, metav1.GetOptions{})
+	var object runtime.Object
+
+	if len(resource.Namespace) == 0 {
+		// cluster-scoped resource
+		object, err = informerManager.Lister(gvr).Get(resource.Name)
+	} else {
+		object, err = informerManager.Lister(gvr).ByNamespace(resource.Namespace).Get(resource.Name)
+	}
 	if err != nil {
-		klog.Errorf("Failed to get workload, kind: %s, namespace: %s, name: %s. Error: %v",
+		// fall back to call api server in case the cache has not been synchronized yet
+		klog.Warningf("Failed to get resource template (%s/%s/%s) from cache, Error: %v. Fall back to call api server.",
 			resource.Kind, resource.Namespace, resource.Name, err)
-		return nil, err
-	}
-
-	return workload, nil
-}
-
-// EnsureWork ensure Work to be created or updated.
-func EnsureWork(c client.Client, workload *unstructured.Unstructured, clusterNames []string, overrideManager overridemanager.OverrideManager,
-	binding metav1.Object, scope apiextensionsv1.ResourceScope) error {
-	referenceRSP, desireReplicaInfos, err := calculateReplicasIfNeeded(c, workload, clusterNames)
-	if err != nil {
-		klog.Errorf("Failed to get ReplicaSchedulingPolicy for %s/%s/%s, err is: %v", workload.GetKind(), workload.GetNamespace(), workload.GetName(), err)
-		return err
-	}
-
-	var workLabel = make(map[string]string)
-
-	for _, clusterName := range clusterNames {
-		// apply override policies
-		clonedWorkload := workload.DeepCopy()
-		cops, ops, err := overrideManager.ApplyOverridePolicies(clonedWorkload, clusterName)
+		object, err = dynamicClient.Resource(gvr).Namespace(resource.Namespace).Get(ctx, resource.Name, metav1.GetOptions{})
 		if err != nil {
-			klog.Errorf("Failed to apply overrides for %s/%s/%s, err is: %v", workload.GetKind(), workload.GetNamespace(), workload.GetName(), err)
-			return err
-		}
-
-		workName := names.GenerateWorkName(workload.GetKind(), workload.GetName(), workload.GetNamespace())
-		workNamespace, err := names.GenerateExecutionSpaceName(clusterName)
-		if err != nil {
-			klog.Errorf("Failed to ensure Work for cluster: %s. Error: %v.", clusterName, err)
-			return err
-		}
-
-		util.MergeLabel(clonedWorkload, util.WorkNamespaceLabel, workNamespace)
-		util.MergeLabel(clonedWorkload, util.WorkNameLabel, workName)
-
-		if scope == apiextensionsv1.NamespaceScoped {
-			util.MergeLabel(clonedWorkload, util.ResourceBindingNamespaceLabel, binding.GetNamespace())
-			util.MergeLabel(clonedWorkload, util.ResourceBindingNameLabel, binding.GetName())
-			workLabel[util.ResourceBindingNamespaceLabel] = binding.GetNamespace()
-			workLabel[util.ResourceBindingNameLabel] = binding.GetName()
-		} else {
-			util.MergeLabel(clonedWorkload, util.ClusterResourceBindingLabel, binding.GetName())
-			workLabel[util.ClusterResourceBindingLabel] = binding.GetName()
-		}
-
-		if clonedWorkload.GetKind() == util.DeploymentKind && referenceRSP != nil {
-			err = applyReplicaSchedulingPolicy(clonedWorkload, desireReplicaInfos[clusterName])
-			if err != nil {
-				klog.Errorf("failed to apply ReplicaSchedulingPolicy for %s/%s/%s in cluster %s, err is: %v",
-					clonedWorkload.GetKind(), clonedWorkload.GetNamespace(), clonedWorkload.GetName(), clusterName, err)
-				return err
-			}
-		}
-
-		workloadJSON, err := clonedWorkload.MarshalJSON()
-		if err != nil {
-			klog.Errorf("Failed to marshal workload, kind: %s, namespace: %s, name: %s. Error: %v",
-				clonedWorkload.GetKind(), clonedWorkload.GetName(), clonedWorkload.GetNamespace(), err)
-			return err
-		}
-
-		work := &workv1alpha1.Work{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:       workName,
-				Namespace:  workNamespace,
-				Finalizers: []string{util.ExecutionControllerFinalizer},
-				Labels:     workLabel,
-			},
-			Spec: workv1alpha1.WorkSpec{
-				Workload: workv1alpha1.WorkloadTemplate{
-					Manifests: []workv1alpha1.Manifest{
-						{
-							RawExtension: runtime.RawExtension{
-								Raw: workloadJSON,
-							},
-						},
-					},
-				},
-			},
-		}
-
-		// set applied override policies if needed.
-		var appliedBytes []byte
-		if cops != nil {
-			appliedBytes, err = cops.MarshalJSON()
-			if err != nil {
-				return err
-			}
-			if appliedBytes != nil {
-				if work.Annotations == nil {
-					work.Annotations = make(map[string]string, 1)
-				}
-				work.Annotations[util.AppliedClusterOverrides] = string(appliedBytes)
-			}
-		}
-		if ops != nil {
-			appliedBytes, err = ops.MarshalJSON()
-			if err != nil {
-				return err
-			}
-			if appliedBytes != nil {
-				if work.Annotations == nil {
-					work.Annotations = make(map[string]string, 1)
-				}
-				work.Annotations[util.AppliedOverrides] = string(appliedBytes)
-			}
-		}
-
-		runtimeObject := work.DeepCopy()
-		operationResult, err := controllerutil.CreateOrUpdate(context.TODO(), c, runtimeObject, func() error {
-			runtimeObject.Annotations = work.Annotations
-			runtimeObject.Labels = work.Labels
-			runtimeObject.Spec = work.Spec
-			return nil
-		})
-		if err != nil {
-			klog.Errorf("Failed to create/update work %s/%s. Error: %v", work.GetNamespace(), work.GetName(), err)
-			return err
-		}
-
-		if operationResult == controllerutil.OperationResultCreated {
-			klog.Infof("Create work %s/%s successfully.", work.GetNamespace(), work.GetName())
-		} else if operationResult == controllerutil.OperationResultUpdated {
-			klog.Infof("Update work %s/%s successfully.", work.GetNamespace(), work.GetName())
-		} else {
-			klog.V(2).Infof("Work %s/%s is up to date.", work.GetNamespace(), work.GetName())
-		}
-	}
-	return nil
-}
-
-func calculateReplicasIfNeeded(c client.Client, workload *unstructured.Unstructured, clusterNames []string) (*v1alpha1.ReplicaSchedulingPolicy, map[string]int64, error) {
-	var err error
-	var referenceRSP *v1alpha1.ReplicaSchedulingPolicy
-	var desireReplicaInfos = make(map[string]int64)
-
-	if workload.GetKind() == util.DeploymentKind {
-		referenceRSP, err = matchReplicaSchedulingPolicy(c, workload)
-		if err != nil {
-			return nil, nil, err
-		}
-		if referenceRSP != nil {
-			desireReplicaInfos, err = calculateReplicas(c, referenceRSP, clusterNames)
-			if err != nil {
-				klog.Errorf("Failed to get desire replicas for %s/%s/%s, err is: %v", workload.GetKind(), workload.GetNamespace(), workload.GetName(), err)
-				return nil, nil, err
-			}
-			klog.V(4).Infof("DesireReplicaInfos with replica scheduling policies(%s/%s) is %v", referenceRSP.Namespace, referenceRSP.Name, desireReplicaInfos)
-		}
-	}
-	return referenceRSP, desireReplicaInfos, nil
-}
-
-func matchReplicaSchedulingPolicy(c client.Client, workload *unstructured.Unstructured) (*v1alpha1.ReplicaSchedulingPolicy, error) {
-	// get all namespace-scoped replica scheduling policies
-	policyList := &v1alpha1.ReplicaSchedulingPolicyList{}
-	if err := c.List(context.TODO(), policyList, &client.ListOptions{Namespace: workload.GetNamespace()}); err != nil {
-		klog.Errorf("Failed to list replica scheduling policies from namespace: %s, error: %v", workload.GetNamespace(), err)
-		return nil, err
-	}
-
-	if len(policyList.Items) == 0 {
-		return nil, nil
-	}
-
-	matchedPolicies := getMatchedReplicaSchedulingPolicy(policyList.Items, workload)
-	if len(matchedPolicies) == 0 {
-		klog.V(2).Infof("No replica scheduling policy for resource: %s/%s", workload.GetNamespace(), workload.GetName())
-		return nil, nil
-	}
-
-	return &matchedPolicies[0], nil
-}
-
-func getMatchedReplicaSchedulingPolicy(policies []v1alpha1.ReplicaSchedulingPolicy, resource *unstructured.Unstructured) []v1alpha1.ReplicaSchedulingPolicy {
-	// select policy in which at least one resource selector matches target resource.
-	resourceMatches := make([]v1alpha1.ReplicaSchedulingPolicy, 0)
-	for _, policy := range policies {
-		if util.ResourceMatchSelectors(resource, policy.Spec.ResourceSelectors...) {
-			resourceMatches = append(resourceMatches, policy)
-		}
-	}
-
-	// Sort by policy names.
-	sort.Slice(resourceMatches, func(i, j int) bool {
-		return resourceMatches[i].Name < resourceMatches[j].Name
-	})
-
-	return resourceMatches
-}
-
-func calculateReplicas(c client.Client, policy *v1alpha1.ReplicaSchedulingPolicy, clusterNames []string) (map[string]int64, error) {
-	weightSum := int64(0)
-	matchClusters := make(map[string]int64)
-	desireReplicaInfos := make(map[string]int64)
-
-	// found out clusters matched the given ReplicaSchedulingPolicy
-	for _, clusterName := range clusterNames {
-		clusterObj := &clusterv1alpha1.Cluster{}
-		if err := c.Get(context.TODO(), client.ObjectKey{Name: clusterName}, clusterObj); err != nil {
-			klog.Errorf("Failed to get member cluster: %s, error: %v", clusterName, err)
+			klog.Errorf("Failed to get resource template (%s/%s/%s) from api server, Error: %v",
+				resource.Kind, resource.Namespace, resource.Name, err)
 			return nil, err
 		}
-		for _, staticWeightRule := range policy.Spec.Preferences.StaticWeightList {
-			if util.ClusterMatches(clusterObj, staticWeightRule.TargetCluster) {
-				weightSum += staticWeightRule.Weight
-				matchClusters[clusterName] = staticWeightRule.Weight
-				break
-			}
-		}
 	}
 
-	allocatedReplicas := int32(0)
-	for clusterName, weight := range matchClusters {
-		desireReplicaInfos[clusterName] = weight * int64(policy.Spec.TotalReplicas) / weightSum
-		allocatedReplicas += int32(desireReplicaInfos[clusterName])
+	unstructuredObj, err := ToUnstructured(object)
+	if err != nil {
+		klog.Errorf("Failed to transform object(%s/%s), Error: %v", resource.Namespace, resource.Name, err)
+		return nil, err
 	}
 
-	if remainReplicas := policy.Spec.TotalReplicas - allocatedReplicas; remainReplicas > 0 {
-		sortedClusters := sortClusterByWeight(matchClusters)
-		for i := 0; remainReplicas > 0; i++ {
-			desireReplicaInfos[sortedClusters[i].ClusterName]++
-			remainReplicas--
-			if i == len(desireReplicaInfos) {
-				i = 0
-			}
-		}
-	}
-
-	for _, clusterName := range clusterNames {
-		if _, exist := matchClusters[clusterName]; !exist {
-			desireReplicaInfos[clusterName] = 0
-		}
-	}
-
-	return desireReplicaInfos, nil
+	return unstructuredObj, nil
 }
 
-func applyReplicaSchedulingPolicy(workload *unstructured.Unstructured, desireReplica int64) error {
-	_, ok, err := unstructured.NestedInt64(workload.Object, SpecField, ReplicasField)
+// FetchResourceTemplatesByLabelSelector fetches the resource templates by label selector to be propagated.
+// Any updates to this resource template are not recommended as it may come from the informer cache.
+// We should abide by the principle of making a deep copy first and then modifying it.
+// See issue: https://github.com/karmada-io/karmada/issues/3878.
+func FetchResourceTemplatesByLabelSelector(
+	dynamicClient dynamic.Interface,
+	informerManager genericmanager.SingleClusterInformerManager,
+	restMapper meta.RESTMapper,
+	resource workv1alpha2.ObjectReference,
+	selector labels.Selector,
+) ([]*unstructured.Unstructured, error) {
+	gvr, err := restmapper.GetGroupVersionResource(restMapper, schema.FromAPIVersionAndKind(resource.APIVersion, resource.Kind))
 	if err != nil {
-		return err
+		klog.Errorf("Failed to get GVR from GVK(%s/%s), Error: %v", resource.APIVersion, resource.Kind, err)
+		return nil, err
 	}
-	if ok {
-		err := unstructured.SetNestedField(workload.Object, desireReplica, SpecField, ReplicasField)
+	var objectList []runtime.Object
+	if len(resource.Namespace) == 0 {
+		// cluster-scoped resource
+		objectList, err = informerManager.Lister(gvr).List(selector)
+	} else {
+		objectList, err = informerManager.Lister(gvr).ByNamespace(resource.Namespace).List(selector)
+	}
+	var objects []*unstructured.Unstructured
+	if err != nil || len(objectList) == 0 {
+		// fall back to call api server in case the cache has not been synchronized yet
+		klog.Warningf("Failed to get resource template (%s/%s/%s) from cache, Error: %v. Fall back to call api server.",
+			resource.Kind, resource.Namespace, resource.Name, err)
+		unstructuredList, err := dynamicClient.Resource(gvr).Namespace(resource.Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
 		if err != nil {
-			return err
+			klog.Errorf("Failed to get resource template (%s/%s/%s) from api server, Error: %v",
+				resource.Kind, resource.Namespace, resource.Name, err)
+			return nil, err
+		}
+		for i := range unstructuredList.Items {
+			objects = append(objects, &unstructuredList.Items[i])
 		}
 	}
-	return nil
+
+	for i := range objectList {
+		unstructuredObj, err := ToUnstructured(objectList[i])
+		if err != nil {
+			klog.Errorf("Failed to transform object(%s/%s), Error: %v", resource.Namespace, resource.Name, err)
+			return nil, err
+		}
+		objects = append(objects, unstructuredObj)
+	}
+	return objects, nil
 }
 
 // GetClusterResourceBindings returns a ClusterResourceBindingList by labels.
-func GetClusterResourceBindings(c client.Client, ls labels.Set) (*workv1alpha1.ClusterResourceBindingList, error) {
-	bindings := &workv1alpha1.ClusterResourceBindingList{}
+func GetClusterResourceBindings(c client.Client, ls labels.Set) (*workv1alpha2.ClusterResourceBindingList, error) {
+	bindings := &workv1alpha2.ClusterResourceBindingList{}
 	listOpt := &client.ListOptions{LabelSelector: labels.SelectorFromSet(ls)}
 
 	return bindings, c.List(context.TODO(), bindings, listOpt)
 }
 
 // GetResourceBindings returns a ResourceBindingList by labels
-func GetResourceBindings(c client.Client, ls labels.Set) (*workv1alpha1.ResourceBindingList, error) {
-	bindings := &workv1alpha1.ResourceBindingList{}
+func GetResourceBindings(c client.Client, ls labels.Set) (*workv1alpha2.ResourceBindingList, error) {
+	bindings := &workv1alpha2.ResourceBindingList{}
 	listOpt := &client.ListOptions{LabelSelector: labels.SelectorFromSet(ls)}
 
 	return bindings, c.List(context.TODO(), bindings, listOpt)
 }
 
-// GetWorks returns a WorkList by labels
-func GetWorks(c client.Client, ls labels.Set) (*workv1alpha1.WorkList, error) {
-	works := &workv1alpha1.WorkList{}
-	listOpt := &client.ListOptions{LabelSelector: labels.SelectorFromSet(ls)}
-
-	return works, c.List(context.TODO(), works, listOpt)
-}
-
 // DeleteWorks will delete all Work objects by labels.
-func DeleteWorks(c client.Client, selector labels.Set) (controllerruntime.Result, error) {
-	workList, err := GetWorks(c, selector)
+func DeleteWorks(ctx context.Context, c client.Client, namespace, name, bindingID string) error {
+	workList, err := GetWorksByBindingID(ctx, c, bindingID, namespace != "")
 	if err != nil {
-		klog.Errorf("Failed to get works by label %v: %v", selector, err)
-		return controllerruntime.Result{Requeue: true}, err
+		klog.Errorf("Failed to get works by (Cluster)ResourceBinding(%s/%s) : %v", namespace, name, err)
+		return err
 	}
 
 	var errs []error
 	for index, work := range workList.Items {
-		if err := c.Delete(context.TODO(), &workList.Items[index]); err != nil {
+		if err := c.Delete(ctx, &workList.Items[index]); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 			klog.Errorf("Failed to delete work(%s/%s): %v", work.Namespace, work.Name, err)
 			errs = append(errs, err)
 		}
 	}
+	return errors.NewAggregate(errs)
+}
 
-	if len(errs) > 0 {
-		return controllerruntime.Result{Requeue: true}, errors.NewAggregate(errs)
+// GenerateNodeClaimByPodSpec will return a NodeClaim from PodSpec.
+func GenerateNodeClaimByPodSpec(podSpec *corev1.PodSpec) *workv1alpha2.NodeClaim {
+	nodeClaim := &workv1alpha2.NodeClaim{
+		NodeSelector: podSpec.NodeSelector,
+		Tolerations:  podSpec.Tolerations,
+	}
+	hasAffinity := podSpec.Affinity != nil && podSpec.Affinity.NodeAffinity != nil && podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil
+	if hasAffinity {
+		nodeClaim.HardNodeAffinity = podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	}
+	if nodeClaim.NodeSelector == nil && nodeClaim.HardNodeAffinity == nil && len(nodeClaim.Tolerations) == 0 {
+		return nil
+	}
+	return nodeClaim
+}
+
+// GenerateReplicaRequirements generates replica requirements for node and resources.
+func GenerateReplicaRequirements(podTemplate *corev1.PodTemplateSpec) *workv1alpha2.ReplicaRequirements {
+	nodeClaim := GenerateNodeClaimByPodSpec(&podTemplate.Spec)
+	resourceRequest := util.EmptyResource().AddPodTemplateRequest(&podTemplate.Spec).ResourceList()
+
+	if nodeClaim != nil || resourceRequest != nil {
+		replicaRequirements := &workv1alpha2.ReplicaRequirements{
+			NodeClaim:       nodeClaim,
+			ResourceRequest: resourceRequest,
+		}
+		if features.FeatureGate.Enabled(features.ResourceQuotaEstimate) {
+			replicaRequirements.Namespace = podTemplate.Namespace
+			// PriorityClassName is set from podTemplate
+			// If it is not set from podTemplate, it is default to an empty string
+			replicaRequirements.PriorityClassName = podTemplate.Spec.PriorityClassName
+		}
+		return replicaRequirements
 	}
 
-	return controllerruntime.Result{}, nil
+	return nil
+}
+
+// ConstructClusterWideKey construct resource ClusterWideKey from binding's objectReference.
+func ConstructClusterWideKey(resource workv1alpha2.ObjectReference) (keys.ClusterWideKey, error) {
+	gv, err := schema.ParseGroupVersion(resource.APIVersion)
+	if err != nil {
+		return keys.ClusterWideKey{}, err
+	}
+	return keys.ClusterWideKey{
+		Group:     gv.Group,
+		Version:   gv.Version,
+		Kind:      resource.Kind,
+		Namespace: resource.Namespace,
+		Name:      resource.Name,
+	}, nil
+}
+
+// EmitClusterEvictionEventForResourceBinding records the eviction event for resourceBinding and its objectReference.
+func EmitClusterEvictionEventForResourceBinding(binding *workv1alpha2.ResourceBinding, cluster string, eventRecorder record.EventRecorder, err error) {
+	if binding == nil {
+		return
+	}
+
+	ref := &corev1.ObjectReference{
+		Kind:       binding.Spec.Resource.Kind,
+		APIVersion: binding.Spec.Resource.APIVersion,
+		Namespace:  binding.Spec.Resource.Namespace,
+		Name:       binding.Spec.Resource.Name,
+		UID:        binding.Spec.Resource.UID,
+	}
+
+	if err != nil {
+		eventRecorder.Eventf(binding, corev1.EventTypeWarning, events.EventReasonEvictWorkloadFromClusterFailed, "Evict from cluster %s failed.", cluster)
+		eventRecorder.Eventf(ref, corev1.EventTypeWarning, events.EventReasonEvictWorkloadFromClusterFailed, "Evict from cluster %s failed.", cluster)
+	} else {
+		eventRecorder.Eventf(binding, corev1.EventTypeNormal, events.EventReasonEvictWorkloadFromClusterSucceed, "Evict from cluster %s succeed.", cluster)
+		eventRecorder.Eventf(ref, corev1.EventTypeNormal, events.EventReasonEvictWorkloadFromClusterSucceed, "Evict from cluster %s succeed.", cluster)
+	}
+}
+
+// EmitClusterEvictionEventForClusterResourceBinding records the eviction event for clusterResourceBinding and its objectReference.
+func EmitClusterEvictionEventForClusterResourceBinding(binding *workv1alpha2.ClusterResourceBinding, cluster string, eventRecorder record.EventRecorder, err error) {
+	if binding == nil {
+		return
+	}
+
+	ref := &corev1.ObjectReference{
+		Kind:       binding.Spec.Resource.Kind,
+		APIVersion: binding.Spec.Resource.APIVersion,
+		Namespace:  binding.Spec.Resource.Namespace,
+		Name:       binding.Spec.Resource.Name,
+		UID:        binding.Spec.Resource.UID,
+	}
+
+	if err != nil {
+		eventRecorder.Eventf(binding, corev1.EventTypeWarning, events.EventReasonEvictWorkloadFromClusterFailed, "Evict from cluster %s failed.", cluster)
+		eventRecorder.Eventf(ref, corev1.EventTypeWarning, events.EventReasonEvictWorkloadFromClusterFailed, "Evict from cluster %s failed.", cluster)
+	} else {
+		eventRecorder.Eventf(binding, corev1.EventTypeNormal, events.EventReasonEvictWorkloadFromClusterSucceed, "Evict from cluster %s succeed.", cluster)
+		eventRecorder.Eventf(ref, corev1.EventTypeNormal, events.EventReasonEvictWorkloadFromClusterSucceed, "Evict from cluster %s succeed.", cluster)
+	}
+}
+
+// ConstructObjectReference constructs ObjectReference from ResourceSelector.
+func ConstructObjectReference(rs policyv1alpha1.ResourceSelector) workv1alpha2.ObjectReference {
+	return workv1alpha2.ObjectReference{
+		APIVersion: rs.APIVersion,
+		Kind:       rs.Kind,
+		Namespace:  rs.Namespace,
+		Name:       rs.Name,
+	}
 }

@@ -1,3 +1,19 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package v1alpha1
 
 import (
@@ -5,9 +21,24 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+const (
+	// ResourceKindWork is kind name of Work.
+	ResourceKindWork = "Work"
+	// ResourceSingularWork is singular name of Work.
+	ResourceSingularWork = "work"
+	// ResourcePluralWork is plural name of Work.
+	ResourcePluralWork = "works"
+	// ResourceNamespaceScopedWork indicates if Work is NamespaceScoped.
+	ResourceNamespaceScopedWork = true
+)
+
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:path=works,scope=Namespaced,shortName=wk,categories={karmada-io}
+// +kubebuilder:printcolumn:JSONPath=`.spec.workload.manifests[*].kind`,name="WORKLOAD-KIND",type=string
+// +kubebuilder:printcolumn:JSONPath=`.status.conditions[?(@.type=="Applied")].status`,name="APPLIED",type=string
+// +kubebuilder:printcolumn:JSONPath=`.metadata.creationTimestamp`,name="AGE",type=date
 
 // Work defines a list of resources to be deployed on the member cluster.
 type Work struct {
@@ -26,6 +57,20 @@ type Work struct {
 type WorkSpec struct {
 	// Workload represents the manifest workload to be deployed on managed cluster.
 	Workload WorkloadTemplate `json:"workload,omitempty"`
+
+	// SuspendDispatching controls whether dispatching should
+	// be suspended, nil means not suspend.
+	// Note: true means stop propagating to the corresponding member cluster, and
+	// does not prevent status collection.
+	// +optional
+	SuspendDispatching *bool `json:"suspendDispatching,omitempty"`
+
+	// PreserveResourcesOnDeletion controls whether resources should be preserved on the
+	// member cluster when the Work object is deleted.
+	// If set to true, resources will be preserved on the member cluster.
+	// Default is false, which means resources will be deleted along with the Work object.
+	// +optional
+	PreserveResourcesOnDeletion *bool `json:"preserveResourcesOnDeletion,omitempty"`
 }
 
 // WorkloadTemplate represents the manifest workload to be deployed on managed cluster.
@@ -61,11 +106,19 @@ type WorkStatus struct {
 // ManifestStatus contains running status of a specific manifest in spec.
 type ManifestStatus struct {
 	// Identifier represents the identity of a resource linking to manifests in spec.
+	// +required
 	Identifier ResourceIdentifier `json:"identifier"`
 
 	// Status reflects running status of current manifest.
 	// +kubebuilder:pruning:PreserveUnknownFields
-	Status runtime.RawExtension `json:",inline"`
+	// +optional
+	Status *runtime.RawExtension `json:"status,omitempty"`
+
+	// Health represents the healthy state of the current resource.
+	// There maybe different rules for different resources to achieve health status.
+	// +kubebuilder:validation:Enum=Healthy;Unhealthy;Unknown
+	// +optional
+	Health ResourceHealth `json:"health,omitempty"`
 }
 
 // ResourceIdentifier provides the identifiers needed to interact with any arbitrary object.
@@ -107,6 +160,23 @@ const (
 	// WorkDegraded represents that the current state of Work does not match
 	// the desired state for a certain period.
 	WorkDegraded string = "Degraded"
+	// WorkDispatching represents the dispatching or suspension status of the Work resource
+	WorkDispatching string = "Dispatching"
+)
+
+// ResourceHealth represents that the health status of the reference resource.
+type ResourceHealth string
+
+const (
+	// ResourceHealthy represents that the health status of the current resource
+	// that applied on the managed cluster is healthy.
+	ResourceHealthy ResourceHealth = "Healthy"
+	// ResourceUnhealthy represents that the health status of the current resource
+	// that applied on the managed cluster is unhealthy.
+	ResourceUnhealthy ResourceHealth = "Unhealthy"
+	// ResourceUnknown represents that the health status of the current resource
+	// that applied on the managed cluster is unknown.
+	ResourceUnknown ResourceHealth = "Unknown"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

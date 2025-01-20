@@ -2,34 +2,28 @@
 
 This document defines a high level roadmap for Karmada development and upcoming releases.
 Community and contributor involvement is vital for successfully implementing all desired items for each release.
-We hope that the items listed below will inspire further engagement from the community to keep karmada progressing and shipping exciting and valuable features.
+We hope that the items listed below will inspire further engagement from the community to keep Karmada progressing and shipping exciting and valuable features.
 
+## 2024 H1
+- Lazy mode of PropagationPolicy
+- Cluster Problem Detector(CPD) - Part one: Cluster condition-based remedy system
+- Scheduler Enhancement - enable scheduler estimator supports resource quota
+- Scheduler Enhancement - Provide a mechanism of re-balance workloads
 
-## 2021 Q1
-- K8s native API support for multi-cluster applications
-- Multi-cluster application status aggregation
-- Per-cluster configuration customization for applications
-- Cluster Affinity Scheduling Policy
-- Multi-cluster HA scheduling policy: spread by cluster
-- Cluster registry; Support register existing clusters
+## 2024 H2
+- AI training and batch job support (Including PyTorch, Spark, Flink and so on)
+- Karmada Dashboard - alpha release
+- Multi-cluster workflow
+- Scheduler Enhancement - Optimize scheduling with GPU resources
 
-## 2021 Q2
-- Multi-cluster application automatic migration (DR)
-- Dynamically split replicas of applications based on multiple dimensions
-- Taint Toleration for clusters
-- Multiple sync mode: Push, Pull
-- Cluster lifecycle management
-
-## 2021 Q3
-- Multi-cluster service discovery
-- Load ingress support across clusters
-- Multi-cluster horizontal auto-scaling for applications
-- Multi-cluster resource re-balancing
-- More Multi-cluster HA scheduling policy: spread by region, zone, provider
-- Aggregated K8s API endpoint
-
-## 2021 Q4
-- CNI adoption with multiple underlying network setup
-- Multi-cluster Service Mesh Support
-- Multi-cluster monitoring & Logging
-- GitOps support
+## Pending
+- Cluster addon management
+- Multi-cluster Application
+- Multi-cluster monitoring
+- Multi-cluster logging
+- Multi-cluster storage
+- Multi-cluster RBAC
+- Multi-cluster networking
+- Data migration across clusters
+- Image registry across clouds
+- Multi-cluster Service Mesh solutions

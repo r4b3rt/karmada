@@ -85,6 +85,9 @@ type Node struct {
 	// If unset a default image will be used, see defaults.Image
 	Image string
 
+	// Labels are the labels with which the respective node will be labeled
+	Labels map[string]string
+
 	/* Advanced fields */
 
 	// ExtraMounts describes additional mount points for the node container
@@ -145,8 +148,10 @@ type Networking struct {
 	// If DisableDefaultCNI is true, kind will not install the default CNI setup.
 	// Instead the user should install their own CNI after creating the cluster.
 	DisableDefaultCNI bool
-	// KubeProxyMode defines if kube-proxy should operate in iptables or ipvs mode
+	// KubeProxyMode defines if kube-proxy should operate in iptables, ipvs or nftables mode
 	KubeProxyMode ProxyMode
+	// DNSSearch defines the DNS search domain to use for nodes. If not set, this will be inherited from the host.
+	DNSSearch *[]string
 }
 
 // ClusterIPFamily defines cluster network IP family
@@ -157,16 +162,22 @@ const (
 	IPv4Family ClusterIPFamily = "ipv4"
 	// IPv6Family sets ClusterIPFamily to ipv6
 	IPv6Family ClusterIPFamily = "ipv6"
+	// DualStackFamily sets ClusterIPFamily to dual
+	DualStackFamily ClusterIPFamily = "dual"
 )
 
 // ProxyMode defines a proxy mode for kube-proxy
 type ProxyMode string
 
 const (
-	// IPTablesMode sets ProxyMode to iptables
-	IPTablesMode ProxyMode = "iptables"
-	// IPVSMode sets ProxyMode to iptables
-	IPVSMode ProxyMode = "ipvs"
+	// IPTablesProxyMode sets ProxyMode to iptables
+	IPTablesProxyMode ProxyMode = "iptables"
+	// IPVSProxyMode sets ProxyMode to ipvs
+	IPVSProxyMode ProxyMode = "ipvs"
+	// NFTablesProxyMode sets ProxyMode to nftables
+	NFTablesProxyMode ProxyMode = "nftables"
+	// NoneProxyMode disables kube-proxy
+	NoneProxyMode ProxyMode = "none"
 )
 
 // PatchJSON6902 represents an inline kustomize json 6902 patch
@@ -187,11 +198,13 @@ type PatchJSON6902 struct {
 // names on disk as opposed to the int32 values, and the serialized field names
 // have been made closer to core/v1 VolumeMount field names
 // In yaml this looks like:
-//  containerPath: /foo
-//  hostPath: /bar
-//  readOnly: true
-//  selinuxRelabel: false
-//  propagation: None
+//
+//	containerPath: /foo
+//	hostPath: /bar
+//	readOnly: true
+//	selinuxRelabel: false
+//	propagation: None
+//
 // Propagation may be one of: None, HostToContainer, Bidirectional
 type Mount struct {
 	// Path of the mount within the container.
@@ -210,10 +223,11 @@ type Mount struct {
 
 // PortMapping specifies a host port mapped into a container port.
 // In yaml this looks like:
-//  containerPort: 80
-//  hostPort: 8000
-//  listenAddress: 127.0.0.1
-//  protocol: TCP
+//
+//	containerPort: 80
+//	hostPort: 8000
+//	listenAddress: 127.0.0.1
+//	protocol: TCP
 type PortMapping struct {
 	// Port within the container.
 	ContainerPort int32
@@ -228,7 +242,7 @@ type PortMapping struct {
 	HostPort int32
 	// TODO: add protocol (tcp/udp) and port-ranges
 	ListenAddress string
-	// Protocol (TCP/UDP)
+	// Protocol (TCP/UDP/SCTP)
 	Protocol PortMappingProtocol
 }
 

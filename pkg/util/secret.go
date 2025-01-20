@@ -1,9 +1,24 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -13,21 +28,9 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// GetTargetSecret will get secrets(type=targetType, namespace=targetNamespace) from a list of secret references.
-func GetTargetSecret(client kubeclient.Interface, secretReferences []corev1.ObjectReference, targetType corev1.SecretType, targetNamespace string) (*corev1.Secret, error) {
-	for _, objectReference := range secretReferences {
-		klog.V(2).Infof("checking secret: %s/%s", targetNamespace, objectReference.Name)
-		secret, err := client.CoreV1().Secrets(targetNamespace).Get(context.TODO(), objectReference.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-
-		if secret.Type == targetType {
-			return secret, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no specific secret found in namespace: %s", targetNamespace)
+// GetSecret just try to get the secret.
+func GetSecret(client kubeclient.Interface, namespace, name string) (*corev1.Secret, error) {
+	return client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 }
 
 // CreateSecret just try to create the secret.
@@ -35,34 +38,33 @@ func CreateSecret(client kubeclient.Interface, secret *corev1.Secret) (*corev1.S
 	st, err := client.CoreV1().Secrets(secret.Namespace).Create(context.TODO(), secret, metav1.CreateOptions{})
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return st, nil
+			return client.CoreV1().Secrets(secret.Namespace).Get(context.TODO(), secret.Name, metav1.GetOptions{})
 		}
-
 		return nil, err
 	}
 
 	return st, nil
 }
 
-// DeleteSecret just try to delete the secret.
-func DeleteSecret(client kubeclient.Interface, namespace, name string) error {
-	err := client.CoreV1().Secrets(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
-}
-
 // PatchSecret just try to patch the secret.
 func PatchSecret(client kubeclient.Interface, namespace, name string, pt types.PatchType, patchSecretBody *corev1.Secret) error {
 	patchSecretByte, err := json.Marshal(patchSecretBody)
 	if err != nil {
-		klog.Errorf("failed to marshal patch body of secret object %v into JSON: %v", patchSecretByte, err)
+		klog.Errorf("Failed to marshal patch body of secret object %v into JSON: %v", patchSecretByte, err)
 		return err
 	}
 
 	_, err = client.CoreV1().Secrets(namespace).Patch(context.TODO(), name, pt, patchSecretByte, metav1.PatchOptions{})
 	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteSecret just try to delete the Secret.
+func DeleteSecret(client kubeclient.Interface, namespace, name string) error {
+	err := client.CoreV1().Secrets(namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 	return nil

@@ -29,10 +29,10 @@ import (
 
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions"
 	"sigs.k8s.io/kind/pkg/cluster/internal/kubeadm"
-	"sigs.k8s.io/kind/pkg/cluster/internal/patch"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/common"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/internal/apis/config"
+	"sigs.k8s.io/kind/pkg/internal/patch"
 )
 
 // Action implements action for creating the node config files
@@ -47,6 +47,11 @@ func NewAction() actions.Action {
 func (a *Action) Execute(ctx *actions.ActionContext) error {
 	ctx.Status.Start("Writing configuration 📜")
 	defer ctx.Status.End(false)
+
+	providerInfo, err := ctx.Provider.Info()
+	if err != nil {
+		return err
+	}
 
 	allNodes, err := ctx.Nodes()
 	if err != nil {
@@ -73,9 +78,10 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 		KubeProxyMode:        string(ctx.Config.Networking.KubeProxyMode),
 		ServiceSubnet:        ctx.Config.Networking.ServiceSubnet,
 		ControlPlane:         true,
-		IPv6:                 ctx.Config.Networking.IPFamily == "ipv6",
+		IPFamily:             ctx.Config.Networking.IPFamily,
 		FeatureGates:         ctx.Config.FeatureGates,
 		RuntimeConfig:        ctx.Config.RuntimeConfig,
+		RootlessProvider:     providerInfo.Rootless,
 	}
 
 	kubeadmConfigPlusPatches := func(node nodes.Node, data kubeadm.ConfigData) func() error {
@@ -92,31 +98,16 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 		}
 	}
 
-	// create the kubeadm join configuration for control plane nodes
-	controlPlanes, err := nodeutils.ControlPlaneNodes(allNodes)
+	// create the kubeadm join configuration for the kubernetes cluster nodes only
+	kubeNodes, err := nodeutils.InternalNodes(allNodes)
 	if err != nil {
 		return err
 	}
 
-	for _, node := range controlPlanes {
+	for _, node := range kubeNodes {
 		node := node             // capture loop variable
 		configData := configData // copy config data
 		fns = append(fns, kubeadmConfigPlusPatches(node, configData))
-	}
-
-	// then create the kubeadm join config for the worker nodes if any
-	workers, err := nodeutils.SelectNodesByRole(allNodes, constants.WorkerNodeRoleValue)
-	if err != nil {
-		return err
-	}
-	if len(workers) > 0 {
-		// create the workers concurrently
-		for _, node := range workers {
-			node := node             // capture loop variable
-			configData := configData // copy config data
-			configData.ControlPlane = false
-			fns = append(fns, kubeadmConfigPlusPatches(node, configData))
-		}
 	}
 
 	// Create the kubeadm config in all nodes concurrently
@@ -126,11 +117,6 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 
 	// if we have containerd config, patch all the nodes concurrently
 	if len(ctx.Config.ContainerdConfigPatches) > 0 || len(ctx.Config.ContainerdConfigPatchesJSON6902) > 0 {
-		// we only want to patch kubernetes nodes
-		// this is a cheap workaround to re-use the already listed
-		// workers + control planes
-		kubeNodes := append([]nodes.Node{}, controlPlanes...)
-		kubeNodes = append(kubeNodes, workers...)
 		fns := make([]func() error, len(kubeNodes))
 		for i, node := range kubeNodes {
 			node := node // capture loop variable
@@ -149,8 +135,8 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 					return errors.Wrap(err, "failed to write patched containerd config")
 				}
 				// restart containerd now that we've re-configured it
-				// skip if the systemd (also the containerd) is not running
-				if err := node.Command("bash", "-c", `! systemctl is-system-running || systemctl restart containerd`).Run(); err != nil {
+				// skip if containerd is not running
+				if err := node.Command("bash", "-c", `! pgrep --exact containerd || systemctl restart containerd`).Run(); err != nil {
 					return errors.Wrap(err, "failed to restart containerd after patching config")
 				}
 				return nil
@@ -201,12 +187,34 @@ func getKubeadmConfig(cfg *config.Cluster, data kubeadm.ConfigData, node nodes.N
 
 	data.NodeAddress = nodeAddress
 	// configure the right protocol addresses
-	if cfg.Networking.IPFamily == "ipv6" {
+	if cfg.Networking.IPFamily == config.IPv6Family || cfg.Networking.IPFamily == config.DualStackFamily {
 		if ip := net.ParseIP(nodeAddressIPv6); ip.To16() == nil {
 			return "", errors.Errorf("failed to get IPv6 address for node %s; is %s configured to use IPv6 correctly?", node.String(), provider)
 		}
 		data.NodeAddress = nodeAddressIPv6
+		if cfg.Networking.IPFamily == config.DualStackFamily {
+			// order matters since the nodeAddress will be used later to configure the apiserver advertise address
+			// Ref: #2484
+			primaryServiceSubnet := strings.Split(cfg.Networking.ServiceSubnet, ",")[0]
+			ip, _, err := net.ParseCIDR(primaryServiceSubnet)
+			if err != nil {
+				return "", fmt.Errorf("failed to parse primary Service Subnet %s (%s): %w", primaryServiceSubnet, cfg.Networking.ServiceSubnet, err)
+			}
+			if ip.To4() != nil {
+				data.NodeAddress = fmt.Sprintf("%s,%s", nodeAddress, nodeAddressIPv6)
+			} else {
+				data.NodeAddress = fmt.Sprintf("%s,%s", nodeAddressIPv6, nodeAddress)
+			}
+		}
 	}
+
+	// configure the node labels
+	if len(configNode.Labels) > 0 {
+		data.NodeLabels = hashMapLabelsToCommaSeparatedLabels(configNode.Labels)
+	}
+
+	// set the node role
+	data.ControlPlane = string(configNode.Role) == constants.ControlPlaneNodeRoleValue
 
 	// generate the config contents
 	cf, err := kubeadm.Config(data)
@@ -259,4 +267,13 @@ func writeKubeadmConfig(kubeadmConfig string, node nodes.Node) error {
 	}
 
 	return nil
+}
+
+// hashMapLabelsToCommaSeparatedLabels converts labels in hashmap form to labels in a comma-separated string form like "key1=value1,key2=value2"
+func hashMapLabelsToCommaSeparatedLabels(labels map[string]string) string {
+	output := ""
+	for key, value := range labels {
+		output += fmt.Sprintf("%s=%s,", key, value)
+	}
+	return strings.TrimSuffix(output, ",") // remove the last character (comma) in the output string
 }

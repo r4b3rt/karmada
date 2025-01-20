@@ -1,15 +1,33 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package namespace
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"strings"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -19,27 +37,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	"github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
+	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
+	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
+	"github.com/karmada-io/karmada/pkg/controllers/binding"
+	"github.com/karmada-io/karmada/pkg/controllers/ctrlutil"
 	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/helper"
 	"github.com/karmada-io/karmada/pkg/util/names"
+	"github.com/karmada-io/karmada/pkg/util/overridemanager"
 )
 
 const (
-	// ControllerName is the controller name that will be used when reporting events.
-	ControllerName              = "namespace-sync-controller"
-	namespaceKarmadaSystem      = "karmada-system"
-	namespaceKarmadaCluster     = "karmada-cluster"
-	namespaceDefault            = "default"
-	karmadaExecutionSpacePrefix = "karmada-es-"
-	kubeSystemNamespacePrefix   = "kube-"
+	// ControllerName is the controller name that will be used when reporting events and metrics.
+	ControllerName = "namespace-sync-controller"
 )
 
 // Controller is to sync Work.
 type Controller struct {
-	client.Client // used to operate Work resources.
-	EventRecorder record.EventRecorder
+	client.Client                // used to operate Work resources.
+	EventRecorder                record.EventRecorder
+	SkippedPropagatingNamespaces []*regexp.Regexp
+	OverrideManager              overridemanager.OverrideManager
 }
 
 // Reconcile performs a full reconciliation for the object referred to by the Request.
@@ -51,14 +70,14 @@ func (c *Controller) Reconcile(ctx context.Context, req controllerruntime.Reques
 		return controllerruntime.Result{}, nil
 	}
 
-	namespace := &v1.Namespace{}
-	if err := c.Client.Get(context.TODO(), req.NamespacedName, namespace); err != nil {
+	namespace := &corev1.Namespace{}
+	if err := c.Client.Get(ctx, req.NamespacedName, namespace); err != nil {
 		// The resource may no longer exist, in which case we stop processing.
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return controllerruntime.Result{}, nil
 		}
 
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 
 	if !namespace.DeletionTimestamp.IsZero() {
@@ -67,78 +86,103 @@ func (c *Controller) Reconcile(ctx context.Context, req controllerruntime.Reques
 		return controllerruntime.Result{}, nil
 	}
 
-	clusterList := &v1alpha1.ClusterList{}
-	if err := c.Client.List(context.TODO(), clusterList); err != nil {
-		klog.Errorf("Failed to list clusters, error: %v", err)
-		return controllerruntime.Result{Requeue: true}, err
+	skipAutoPropagation := util.GetLabelValue(namespace.Labels, policyv1alpha1.NamespaceSkipAutoPropagationLabel)
+	if strings.ToLower(skipAutoPropagation) == "true" {
+		klog.Infof("Skip auto propagation namespace:%s", namespace.Name)
+		return controllerruntime.Result{}, nil
 	}
 
-	err := c.buildWorks(namespace, clusterList.Items)
+	clusterList := &clusterv1alpha1.ClusterList{}
+	if err := c.Client.List(ctx, clusterList); err != nil {
+		klog.Errorf("Failed to list clusters, error: %v", err)
+		return controllerruntime.Result{}, err
+	}
+
+	err := c.buildWorks(ctx, namespace, clusterList.Items)
 	if err != nil {
 		klog.Errorf("Failed to build work for namespace %s. Error: %v.", namespace.GetName(), err)
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 
 	return controllerruntime.Result{}, nil
 }
 
 func (c *Controller) namespaceShouldBeSynced(namespace string) bool {
-	if namespace == namespaceKarmadaCluster || namespace == namespaceKarmadaSystem || namespace == namespaceDefault ||
-		strings.HasPrefix(namespace, karmadaExecutionSpacePrefix) || strings.HasPrefix(namespace, kubeSystemNamespacePrefix) {
+	if names.IsReservedNamespace(namespace) || namespace == names.NamespaceDefault {
 		return false
+	}
+
+	for _, nsRegexp := range c.SkippedPropagatingNamespaces {
+		if match := nsRegexp.MatchString(namespace); match {
+			return false
+		}
 	}
 	return true
 }
 
-func (c *Controller) buildWorks(namespace *v1.Namespace, clusters []v1alpha1.Cluster) error {
-	uncastObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(namespace)
+func (c *Controller) buildWorks(ctx context.Context, namespace *corev1.Namespace, clusters []clusterv1alpha1.Cluster) error {
+	namespaceObj, err := helper.ToUnstructured(namespace)
 	if err != nil {
 		klog.Errorf("Failed to transform namespace %s. Error: %v", namespace.GetName(), err)
-		return nil
+		return err
 	}
-	namespaceObj := &unstructured.Unstructured{Object: uncastObj}
 
-	for _, cluster := range clusters {
-		workNamespace, err := names.GenerateExecutionSpaceName(cluster.Name)
-		if err != nil {
-			klog.Errorf("Failed to generate execution space name for member cluster %s, err is %v", cluster.Name, err)
-			return err
-		}
+	errChan := make(chan error, len(clusters))
+	for i := range clusters {
+		go func(cluster *clusterv1alpha1.Cluster, ch chan<- error) {
+			clonedNamespaced := namespaceObj.DeepCopy()
 
-		workName := names.GenerateWorkName(namespaceObj.GetKind(), namespaceObj.GetName(), namespaceObj.GetNamespace())
-		objectMeta := metav1.ObjectMeta{
-			Name:       workName,
-			Namespace:  workNamespace,
-			Finalizers: []string{util.ExecutionControllerFinalizer},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(namespace, namespace.GroupVersionKind()),
-			},
-		}
+			// namespace only care about ClusterOverridePolicy
+			cops, _, err := c.OverrideManager.ApplyOverridePolicies(clonedNamespaced, cluster.Name)
+			if err != nil {
+				klog.Errorf("Failed to apply overrides for %s/%s/%s, err is: %v", clonedNamespaced.GetKind(), clonedNamespaced.GetNamespace(), clonedNamespaced.GetName(), err)
+				ch <- fmt.Errorf("sync namespace(%s) to cluster(%s) failed due to: %v", clonedNamespaced.GetName(), cluster.GetName(), err)
+				return
+			}
 
-		util.MergeLabel(namespaceObj, util.WorkNamespaceLabel, workNamespace)
-		util.MergeLabel(namespaceObj, util.WorkNameLabel, workName)
+			annotations, err := binding.RecordAppliedOverrides(cops, nil, nil)
+			if err != nil {
+				klog.Errorf("Failed to record appliedOverrides, Error: %v", err)
+				ch <- fmt.Errorf("sync namespace(%s) to cluster(%s) failed due to: %v", clonedNamespaced.GetName(), cluster.GetName(), err)
+				return
+			}
 
-		namespaceJSON, err := namespaceObj.MarshalJSON()
-		if err != nil {
-			klog.Errorf("Failed to marshal namespace %s. Error: %v", namespaceObj.GetName(), err)
-			return err
-		}
+			workName := names.GenerateWorkName(namespaceObj.GetKind(), namespaceObj.GetName(), namespaceObj.GetNamespace())
+			objectMeta := metav1.ObjectMeta{
+				Name:       workName,
+				Namespace:  names.GenerateExecutionSpaceName(cluster.Name),
+				Finalizers: []string{util.ExecutionControllerFinalizer},
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(namespace, namespace.GroupVersionKind()),
+				},
+				Annotations: annotations,
+			}
 
-		err = util.CreateOrUpdateWork(c.Client, objectMeta, namespaceJSON)
-		if err != nil {
-			return err
+			if err = ctrlutil.CreateOrUpdateWork(ctx, c.Client, objectMeta, clonedNamespaced); err != nil {
+				ch <- fmt.Errorf("sync namespace(%s) to cluster(%s) failed due to: %v", clonedNamespaced.GetName(), cluster.GetName(), err)
+				return
+			}
+			ch <- nil
+		}(&clusters[i], errChan)
+	}
+
+	var errs []error
+	for range clusters {
+		if err := <-errChan; err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return nil
+
+	return utilerrors.NewAggregate(errs)
 }
 
 // SetupWithManager creates a controller and register to controller manager.
 func (c *Controller) SetupWithManager(mgr controllerruntime.Manager) error {
-	namespaceFn := handler.MapFunc(
-		func(a client.Object) []reconcile.Request {
+	clusterNamespaceFn := handler.MapFunc(
+		func(ctx context.Context, _ client.Object) []reconcile.Request {
 			var requests []reconcile.Request
-			namespaceList := &v1.NamespaceList{}
-			if err := c.Client.List(context.TODO(), namespaceList); err != nil {
+			namespaceList := &corev1.NamespaceList{}
+			if err := c.Client.List(ctx, namespaceList); err != nil {
 				klog.Errorf("Failed to list namespace, error: %v", err)
 				return nil
 			}
@@ -151,11 +195,11 @@ func (c *Controller) SetupWithManager(mgr controllerruntime.Manager) error {
 			return requests
 		})
 
-	predicate := builder.WithPredicates(predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
+	clusterPredicate := builder.WithPredicates(predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
 			return true
 		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
+		UpdateFunc: func(event.UpdateEvent) bool {
 			return false
 		},
 		DeleteFunc: func(event.DeleteEvent) bool {
@@ -166,7 +210,77 @@ func (c *Controller) SetupWithManager(mgr controllerruntime.Manager) error {
 		},
 	})
 
+	clusterOverridePolicyNamespaceFn := handler.MapFunc(
+		func(_ context.Context, obj client.Object) []reconcile.Request {
+			var requests []reconcile.Request
+			cop, ok := obj.(*policyv1alpha1.ClusterOverridePolicy)
+			if !ok {
+				return requests
+			}
+
+			selectedNamespaces := sets.NewString()
+			containsAllNamespace := false
+			for _, rs := range cop.Spec.ResourceSelectors {
+				if rs.APIVersion != "v1" || rs.Kind != "Namespace" {
+					continue
+				}
+
+				if rs.Name == "" {
+					containsAllNamespace = true
+					break
+				}
+
+				selectedNamespaces.Insert(rs.Name)
+			}
+
+			if containsAllNamespace {
+				namespaceList := &corev1.NamespaceList{}
+				if err := c.Client.List(context.TODO(), namespaceList); err != nil {
+					klog.Errorf("Failed to list namespace, error: %v", err)
+					return nil
+				}
+
+				for _, namespace := range namespaceList.Items {
+					requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+						Name: namespace.Name,
+					}})
+				}
+
+				return requests
+			}
+
+			for _, ns := range selectedNamespaces.UnsortedList() {
+				requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+					Name: ns,
+				}})
+			}
+
+			return requests
+		})
+
+	clusterOverridePolicyPredicate := builder.WithPredicates(predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return true
+		},
+		UpdateFunc: func(event.UpdateEvent) bool {
+			return true
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	})
+
 	return controllerruntime.NewControllerManagedBy(mgr).
-		For(&v1.Namespace{}).Watches(&source.Kind{Type: &v1alpha1.Cluster{}}, handler.EnqueueRequestsFromMapFunc(namespaceFn),
-		predicate).Complete(c)
+		Named(ControllerName).
+		For(&corev1.Namespace{}).
+		Watches(&clusterv1alpha1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(clusterNamespaceFn),
+			clusterPredicate).
+		Watches(&policyv1alpha1.ClusterOverridePolicy{},
+			handler.EnqueueRequestsFromMapFunc(clusterOverridePolicyNamespaceFn),
+			clusterOverridePolicyPredicate).
+		Complete(c)
 }
